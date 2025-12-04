@@ -1,0 +1,3065 @@
+---
+title: "FIN550 Final Project"
+output: html_document
+---
+
+---
+# **Property Assessment CCAO** 
+### **FIN 550 Final Project**
+
+This R script contains the full workflow to:
+   - Load and process (ETL) Cook County property datasets
+   - Perform Exploratory Data Analysis (EDA)
+   - Develop and apply models for predicting residential property values
+ 
+The script produces the final 'assessed_value.csv' file for project submission.
+
+
+---
+### **Extract, Transform, Load**
+
+##### Install & Load Required Packages
+
+```{r}
+# Install and load required packages
+
+# Function to install packages if not already installed
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE, quietly = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+  }
+}
+
+# Data manipulation and ETL
+install_if_missing("readr")
+install_if_missing("dplyr")
+install_if_missing("tidyr")
+install_if_missing("data.table")
+install_if_missing("e1071")
+
+# EDA and visualization
+install_if_missing("ggplot2")
+install_if_missing("gridExtra")
+install_if_missing("corrplot")
+install_if_missing("GGally")
+install_if_missing("skimr")
+
+# Modeling - Linear Models
+install_if_missing("caret")
+install_if_missing("glmnet")
+install_if_missing("MASS")
+install_if_missing("forcats")
+
+# Modeling - Tree-based methods
+install_if_missing("rpart")
+install_if_missing("rpart.plot")
+install_if_missing("randomForest")
+install_if_missing("ranger")
+install_if_missing("rBayesianOptimization")
+install_if_missing("xgboost")
+install_if_missing("Matrix")
+
+# Model evaluation and tuning
+install_if_missing("Metrics")
+install_if_missing("MLmetrics")
+
+# Missing data imputation
+install_if_missing("mice")
+
+# Load libraries
+library(readr)                 # Reading CSV files
+library(dplyr)                 # Data manipulation
+library(tidyr)                 # Data tidying
+library(data.table)            # Fast data manipulation
+library(e1071)                 # Skewness calculation
+
+library(ggplot2)               # Visualization
+library(gridExtra)             # Grid of plots
+library(corrplot)              # Correlation plots
+library(GGally)                # Pairwise plots
+library(skimr)                 # Summary statistics
+
+library(caret)                 # Model training and evaluation
+library(glmnet)                # Regularized regression (Ridge, Lasso, Elastic Net)
+library(MASS)                  # stepAIC
+library(forcats)               # fct_lump
+
+library(rpart)                 # Decision trees
+library(rpart.plot)            # Decision tree visualization
+library(randomForest)          # Random Forest
+library(ranger)                # Random Forest
+library(rBayesianOptimization) # Optuna Titration & Convergence
+library(xgboost)               # XGBoost
+library(Matrix)                # Sparse Matrix Operations
+
+library(Metrics)               # Model evaluation metrics
+library(MLmetrics)             # Additional ML metrics
+
+library(mice)                  # Multiple imputation by chained equations
+
+# Force R to always use the dplyr version
+select <- dplyr::select
+
+# Set random seed for reproducibility
+set.seed(550)
+
+cat("All required packages loaded successfully.\n")
+```
+
+##### Load the Datasets
+
+```{r}
+# Load the datasets
+historic_data <- read_csv('data/historic_property_data.csv')
+predict_set <- read_csv('data/predict_property_data.csv')
+
+# Display basic information about the datasets
+cat("Historic Data Shape:", dim(historic_data), "\n")
+cat("Predict Set Shape:", dim(predict_set), "\n")
+```
+
+##### Data Types *(Nominal, Ordinal, Integer, Continuous, Booleen)*
+
+##### Ordinal Reclass
+
+These categorical fields have a meaningful order and are candidates for coercion to ordered factors
+
+```{r}
+# ORDINAL VARIABLES: MARK AS ORDERED + REPORT LEVELS
+cat("=== Ordinal Reclassification (mark ordered, no coercion) ===\n")
+
+# Variables we want to treat as ordinal (names only)
+ordinal_vars <- c(
+  "char_apts",
+  "char_attic_fnsh",
+  "char_attic_type",
+  "char_bsmt_fin",
+  "char_cnst_qlty",
+  "char_gar1_size",
+  "char_repair_cnd",
+  "char_site",
+  "char_type_resd",
+  "geo_fs_flood_risk_direction",
+  "geo_fs_flood_factor",
+  "time_sale_quarter_of_year",
+  "time_sale_month_of_year"
+)
+
+make_ordered_and_report <- function(df, dataset_name, vars) {
+  for (var in vars) {
+    if (!var %in% names(df)) next
+    
+    x <- df[[var]]
+    # Work with whatever encoding is already present (numeric or character)
+    x_char <- as.character(x)
+    lv <- sort(unique(x_char[!is.na(x_char)]))
+    
+    df[[var]] <- factor(x_char, levels = lv, ordered = TRUE)
+    
+    cat(sprintf(
+      "- [%s] %s: %d levels -> %s\n",
+      dataset_name, var, length(lv), paste(lv, collapse = ", ")
+    ))
+  }
+  df
+}
+
+# Apply to both datasets
+historic_data <- make_ordered_and_report(historic_data, "historic_data", ordinal_vars)
+predict_set   <- make_ordered_and_report(predict_set,   "predict_set",   ordinal_vars)
+
+cat("Ordinal marking complete (no new levels created, none coerced to NA).\n")
+```
+
+#### Numeric Reclassification (Integer vs Continuous)
+
+
+```{r}
+# Reclassify numeric variables into Integer vs Continuous (codebook-informed, manual lists)
+cat("=== Numeric Reclassification (Integer vs Continuous) ===\n")
+
+# Updated classification, see reclassification prompt for rationale
+integer_vars <- c(
+  "char_age",                        # Age in years
+  "char_beds",                       # Count of bedrooms
+  "char_fbath",                      # Count of full baths
+  "char_frpl",                       # Count of fireplaces
+  "char_hbath",                      # Count of half baths
+  "char_ncu",                        # Count of commercial units
+  "char_rooms",                      # Count of rooms
+  "econ_foreclosures_month_town",    # Count
+  "econ_foreclosures_quarter_town",  # Count
+  "geo_tract_pop",                   # Population count
+  "meta_year",                       # Year
+  "meta_num_288s_active",            # Count
+  "meta_num_288s_ended",             # Count
+  "time_sale_year",                  # Year
+  "time_sale_quarter",               # Count of quarters since 1997
+  "time_sale_month",                 # Count of months since 1997
+  "time_sale_week",                  # Count of weeks since 1997
+  "time_sale_day",                   # Count of days since 1997
+  "time_sale_week_of_year",          # 1-52
+  "time_sale_day_of_year"            # 1-365
+)
+
+continuous_vars <- c(
+  "char_bldg_sf",                    # Square footage
+  "char_hd_sf",                      # Land square footage
+  "char_ot_impr",                    # Value of other improvements
+  "char_volume",                     # Volume measurement
+  "econ_midincome",                  # Median Income
+  "econ_tax_amt_paid",               # Currency
+  "econ_tax_rate",                   # Rate
+  "geo_black_perc",                  # Percentage
+  "geo_asian_perc",                  # Percentage
+  "geo_his_perc",                    # Percentage
+  "geo_white_perc",                  # Percentage
+  "geo_other_perc",                  # Percentage
+  "geo_longitude",                   # Coordinate
+  "geo_latitude",                    # Coordinate
+  "meta_per_ass",                    # Percentage
+  "meta_2yr_pri_board_est_bldg",     # Currency
+  "meta_2yr_pri_board_est_land",     # Currency
+  "meta_1yr_pri_board_est_bldg",     # Currency
+  "meta_1yr_pri_board_est_land",     # Currency
+  "meta_mailed_est_bldg",            # Currency
+  "meta_mailed_est_land",            # Currency
+  "meta_certified_est_bldg",         # Currency
+  "meta_certified_est_land",         # Currency
+  "meta_sale_price",                 # Currency
+  "meta_nbhd_avg",                   # Currency
+  "meta_nbhd_med",                   # Currency
+  "sale_price"                       # Currency
+)
+
+numeric_vars_all <- c(integer_vars, continuous_vars)
+
+cat(sprintf("Identified %d integer vars, %d continuous vars\n", length(integer_vars), length(continuous_vars)))
+```
+
+#### Boolean Reclassification
+
+```{r}
+# Reframing Binary Nominal Variables as Logical. We convert them to TRUE/FALSE
+binary_yes_no_vars <- c(
+  "char_air",         # 1=Central A/C, 2=No Central A/C
+  "char_gar1_area",   # 1=Yes (Garage in bldg area), 2=No
+  "char_gar1_att",    # 1=Yes (Attached), 2=No
+  "char_renovation",  # 1=Yes, 2=No
+  "char_tp_dsgn"      # 1=Yes (Cathedral Ceiling), 2=No
+)
+
+convert_to_logical <- function(df, vars) {
+  # Filter for vars that actually exist in the dataframe
+  vars_present <- vars[vars %in% names(df)]
+  
+  if(length(vars_present) > 0) {
+    cat(sprintf("Converting %d variables to LOGICAL (1=TRUE, 2=FALSE)...\n", length(vars_present)))
+    
+    for (v in vars_present) {
+      original_vals <- df[[v]]
+      new_vals <- dplyr::case_when(
+        original_vals %in% c(1, "1") ~ TRUE,
+        original_vals %in% c(2, "2") ~ FALSE,
+        TRUE ~ NA
+      )
+      df[[v]] <- new_vals
+    }
+  }
+  return(df)
+}
+
+# Apply to datasets
+historic_data <- convert_to_logical(historic_data, binary_yes_no_vars)
+predict_set   <- convert_to_logical(predict_set, binary_yes_no_vars)
+
+# List of all boolean/logical variables for classification code below
+boolean_vars <- c(
+  "geo_floodplain",
+  "geo_ohare_noise",
+  "geo_withinmr100",
+  "geo_withinmr101300",
+  "ind_multi_code",
+  "ind_large_home",
+  "ind_class_error",
+  "ind_large_lot",
+  "ind_garage",
+  "ind_pure_market",
+  "time_sale_during_school_year",
+  "time_sale_during_holidays",
+  binary_yes_no_vars
+)
+
+# Verification
+cat("\nVerification of Logical Conversion:\n")
+str(historic_data[binary_yes_no_vars[binary_yes_no_vars %in% names(historic_data)]])
+```
+
+```{r}
+# Helper function: maps each variable name to its type label (character value)
+get_var_type_map <- function(df) {
+  # Detect if ordinal_vars exists
+  ord_vars <- if (exists("ordinal_vars")) ordinal_vars else character()
+  all_vars <- names(df)
+  type_map <- setNames(rep("Nominal", length(all_vars)), all_vars)
+  type_map[all_vars %in% integer_vars]    <- "Integer"
+  type_map[all_vars %in% continuous_vars] <- "Continuous"
+  type_map[all_vars %in% boolean_vars]    <- "Boolean"
+  type_map[all_vars %in% ord_vars]        <- "Ordinal"
+  return(type_map)
+}
+
+# Example: get type mapping for later use
+var_type_map_historic <- get_var_type_map(historic_data)
+var_type_map_predict  <- get_var_type_map(predict_set)
+
+# Print simple summary of variable counts by type
+cat("\n=== Variable Type Counts (from Classification Vectors) ===\n")
+
+summarize_types <- function(df, dataset_name) {
+  type_map <- get_var_type_map(df)
+  n_integer    <- sum(type_map == "Integer")
+  n_continuous <- sum(type_map == "Continuous")
+  n_boolean    <- sum(type_map == "Boolean")
+  n_ordinal    <- sum(type_map == "Ordinal")
+  n_nominal    <- sum(type_map == "Nominal")
+  cat(sprintf("%s:\n", dataset_name))
+  cat(sprintf("  Integer     : %2d vars\n", n_integer))
+  cat(sprintf("  Continuous  : %2d vars\n", n_continuous))
+  cat(sprintf("  Boolean     : %2d vars\n", n_boolean))
+  cat(sprintf("  Ordinal     : %2d vars\n", n_ordinal))
+  cat(sprintf("  Nominal     : %2d vars\n", n_nominal))
+}
+
+summarize_types(historic_data, "Historic Data")
+summarize_types(predict_set, "Predict Set")
+```
+
+---
+### **NA Handling & MICE**
+
+##### Observe Missing Values
+
+```{r}
+# Analyze percent of all *data* (cells) missing by type
+cat("=== Percent of Total Data Missing by Variable Type ===\n")
+
+# Function to calculate % of total *data cells* missing per type
+analyze_missing_by_dtype <- function(data, dataset_name) {
+  cat(paste0(dataset_name, ":\n"))
+  all_vars <- names(data)
+  n_rows <- nrow(data)
+  # Get type for all columns
+  dtype_per_col <- get_var_type_map(data)[all_vars]
+  types_for_summary <- c("Integer", "Continuous", "Nominal", "Ordinal", "Boolean")
+  # How many cells ("slots") exist of each type
+  slots_by_type <- sapply(types_for_summary, function(t) sum(dtype_per_col == t) * n_rows)
+  # How many missing cells by type
+  missing_by_type <- sapply(types_for_summary, function(t) {
+    these_cols <- all_vars[dtype_per_col == t]
+    if(length(these_cols) == 0) return(0)
+    sum(is.na(data[these_cols]))
+  })
+  total_cells <- n_rows * ncol(data)
+  total_missing <- sum(is.na(data))
+  pct_missing_by_type <- ifelse(slots_by_type > 0, missing_by_type / total_cells * 100, 0)
+  names(missing_by_type) <- types_for_summary
+  names(pct_missing_by_type) <- types_for_summary
+  for (type_str in types_for_summary) {
+    cat(sprintf("  %-11s: %.2f%% of total data cells missing (%d/%d cells)\n", 
+                type_str,
+                round(pct_missing_by_type[type_str], 2),
+                missing_by_type[type_str],
+                total_cells))
+  }
+  cat(sprintf("  Total:       %.2f%% of total data cells missing (%d/%d cells)\n", 
+              round(total_missing/total_cells*100, 2), 
+              total_missing, 
+              total_cells))
+}
+
+analyze_missing_by_dtype(historic_data, "Historic Data")
+analyze_missing_by_dtype(predict_set, "Predict Set")
+```
+
+```{r}
+# Print all columns and their missing % for both datasets, ordered by Percent_Missing DESC
+get_missing_pct_df <- function(df, dataset_name) { data.frame(Dataset = dataset_name, Column = names(df), Percent_Missing = round(colMeans(is.na(df)) * 100, 2), row.names = NULL) }
+
+missing_historic <- get_missing_pct_df(historic_data, "historic_data")
+missing_predict <- get_missing_pct_df(predict_set, "predict_set")
+
+missing_all <- rbind(missing_historic, missing_predict)
+
+# Order by Percent_Missing DESC
+missing_all <- missing_all[order(-missing_all$Percent_Missing), ]
+
+cat("\nAll columns and their percent missing (both datasets):\n")
+print(missing_all)
+```
+
+##### Missing Value Handling *(Drop High-Missing Columns)*
+
+- Drop any column with >50% missing values from both datasets
+
+```{r}
+# Compute percent missing per column for both datasets
+missing_historic_pct <- colMeans(is.na(historic_data)) * 100
+missing_predict_pct <- colMeans(is.na(predict_set)) * 100
+
+# Identify columns with >50% missing in historic data
+high_missing_historic <- names(missing_historic_pct[missing_historic_pct > 50])
+cat("\nColumns with >50% missing in historic data:", length(high_missing_historic), "\n")
+if(length(high_missing_historic) > 0) print(high_missing_historic)
+
+# Identify columns with >50% missing in predict set
+high_missing_predict <- names(missing_predict_pct[missing_predict_pct > 50])
+cat("\nColumns with >50% missing in predict set:", length(high_missing_predict), "\n")
+if(length(high_missing_predict) > 0) print(high_missing_predict)
+
+# Get union of columns to drop (present in either dataset)
+cols_to_drop <- unique(c(high_missing_historic, high_missing_predict))
+cat("\nTotal unique columns to drop:", length(cols_to_drop), "\n")
+
+# Drop high-missing columns from both datasets using dplyr::select()
+if(length(cols_to_drop) > 0) {
+  cols_to_drop_historic <- intersect(cols_to_drop, names(historic_data))
+  cols_to_drop_predict <- intersect(cols_to_drop, names(predict_set))
+  if(length(cols_to_drop_historic) > 0) {
+    historic_data <- historic_data %>% dplyr::select(-all_of(cols_to_drop_historic))
+    cat("Dropped", length(cols_to_drop_historic), "columns from historic data\n")
+  }
+  if(length(cols_to_drop_predict) > 0) {
+    predict_set <- predict_set %>% dplyr::select(-all_of(cols_to_drop_predict))
+    cat("Dropped", length(cols_to_drop_predict), "columns from predict set\n")
+  }
+}
+
+# Check remaining missing values
+remaining_missing_historic <- sum(is.na(historic_data))
+remaining_missing_predict <- sum(is.na(predict_set))
+cat("\nRemaining missing values in historic data:", remaining_missing_historic, "\n")
+cat("Remaining missing values in predict set:", remaining_missing_predict, "\n")
+```
+
+```{r}
+# Count remaining columns by type for each dataset
+count_vars_by_type <- function(data, dataset_name) {
+  dtype_map <- get_var_type_map(data)
+  type_counts <- table(factor(dtype_map, levels = c("Integer", "Continuous", "Nominal", "Ordinal", "Boolean")))
+  cat(paste0("=== Remaining Columns by Type in ", dataset_name, " ===\n"))
+  for(type in names(type_counts)) {
+    cat(sprintf("  %-11s: %d\n", type, type_counts[[type]]))
+  }
+  cat(sprintf("  Total:       %d columns\n\n", ncol(data)))
+}
+
+count_vars_by_type(historic_data, "Historic Data")
+count_vars_by_type(predict_set, "Predict Set")
+```
+
+```{r}
+# Analyze percent missing by variable type (out of slots of that type)
+cat("=== Percent Missing by Variable Type (out of each type's entries) ===\n")
+
+# Function to calculate % missing per *type* (out of all values of just that type)
+analyze_missing_by_dtype <- function(data, dataset_name) {
+  cat(paste0(dataset_name, ":\n"))
+  all_vars <- names(data)
+  n_rows <- nrow(data)
+  # Get type for all columns
+  dtype_per_col <- get_var_type_map(data)[all_vars]
+  types_for_summary <- c("Integer", "Continuous", "Nominal", "Ordinal", "Boolean")
+  # How many cells ("slots") exist of each type
+  slots_by_type <- sapply(types_for_summary, function(t) sum(dtype_per_col == t) * n_rows)
+  # How many missing cells by type
+  missing_by_type <- sapply(types_for_summary, function(t) {
+    these_cols <- all_vars[dtype_per_col == t]
+    if(length(these_cols) == 0) return(0)
+    sum(is.na(data[these_cols]))
+  })
+  total_cells <- n_rows * ncol(data)
+  total_missing <- sum(is.na(data))
+  pct_missing_by_type <- ifelse(slots_by_type > 0, missing_by_type / slots_by_type * 100, 0)
+  names(missing_by_type) <- types_for_summary
+  names(pct_missing_by_type) <- types_for_summary
+  for (type_str in types_for_summary) {
+    cat(sprintf("  %-11s: %.2f%% missing in this type (%d/%d cells)\n", 
+                type_str,
+                round(pct_missing_by_type[type_str], 2),
+                missing_by_type[type_str],
+                slots_by_type[type_str]))
+  }
+  cat(sprintf("  Total:       %.2f%% of total data cells missing (%d/%d cells)\n", 
+              round(total_missing/total_cells*100, 2), 
+              total_missing, 
+              total_cells))
+}
+
+analyze_missing_by_dtype(historic_data, "Historic Data")
+analyze_missing_by_dtype(predict_set, "Predict Set")
+```
+
+##### Missing Value Handling *(MICE Protocol)*
+
+- **MICE Imputation** — Apply multivariate imputation by chained equations to remaining missing values:
+
+   - ***PMM*** *(Predictive Mean Matching)* *{Numeric variables}*: Predicts missing values by matching to observed values with similar predicted means, preserving the original distribution
+   - ***CART*** *(Classification and Regression Trees)* *{Categorical Variables}*: Uses decision tree models to predict missing categories based on other variables
+   - ***Sample*** *{High Cardinality Vars}* *{Categorical Variables}*: Simple random imputation based on the distribution of the feature
+   - ***LogReg*** *(Logistic Regression)* *{Logical/Binary Variables}*: Models the probability of TRUE/FALSE outcomes using logistic regression
+
+ - MICE preserves relationships between variables and maintains distributional properties
+
+```{r}
+# PRE-IMPUTATION: CONVERT CATEGORICALS & BOOLEANS TO FACTORS
+cat("\n=== Converting Nominal/Ordinal vars to factor, Boolean vars to TRUE/FALSE factor only ===\n")
+flush.console()
+
+cb_type_lookup_hist <- get_var_type_map(historic_data)
+cb_type_lookup_pred <- get_var_type_map(predict_set)
+
+coerce_bool_column <- function(x, col_name, dataset_name) {
+  cls <- class(x)[1]
+
+  # Logical → factor(FALSE, TRUE)
+  if (is.logical(x)) {
+    x_fac <- factor(x, levels = c(FALSE, TRUE))
+    cat(sprintf("  [%s] %s: logical → factor(FALSE/TRUE)\n", dataset_name, col_name))
+    return(x_fac)
+  }
+
+  # Numeric/integer {0,1} → factor(FALSE, TRUE)
+  if (is.numeric(x) || is.integer(x)) {
+    u <- sort(unique(na.omit(x)))
+    if (length(u) <= 2 && all(u %in% c(0, 1))) {
+      x_logic <- ifelse(is.na(x), NA, as.logical(x))
+      x_fac <- factor(x_logic, levels = c(FALSE, TRUE))
+      cat(sprintf("  [%s] %s: numeric {0,1} → logical → factor(FALSE/TRUE)\n", dataset_name, col_name))
+      return(x_fac)
+    } else {
+      warning(sprintf("[%s] %s labeled Boolean but numeric with values: %s; treating as nominal factor.",
+                      dataset_name, col_name, paste(u, collapse = ", ")))
+      return(factor(x))
+    }
+  }
+
+  # Factor with 2 levels 
+  if (is.factor(x)) {
+    # Case 1: 2 levels and are exactly c("FALSE", "TRUE") or logical labels
+    lv <- levels(x)
+    if (length(lv) == 2) {
+      # Accept also if they're 0/1 and can be mapped to logical
+      if (all(lv %in% c("FALSE", "TRUE"))) {
+        cat(sprintf("  [%s] %s: factor(FALSE,TRUE) kept as Boolean factor\n",
+                    dataset_name, col_name))
+        return(factor(x, levels = c("FALSE", "TRUE")))
+      } else if (all(lv %in% c("0","1"))) {
+        # Convert to logical, then factor(FALSE,TRUE)
+        x_logic <- ifelse(is.na(x), NA, as.logical(as.integer(as.character(x))))
+        x_fac <- factor(x_logic, levels = c(FALSE, TRUE))
+        cat(sprintf("  [%s] %s: factor(0,1) → logical → factor(FALSE/TRUE)\n", dataset_name, col_name))
+        return(x_fac)
+      } else {
+        # Otherwise, treat as logical only if value labels can be interpreted as logical
+        # Try coercion and warn otherwise
+        x_logic <- suppressWarnings(as.logical(as.character(x)))
+        if (all(is.na(x_logic) == is.na(x))) {
+          # only if all levels are interpretable as logical
+          cat(sprintf("  [%s] %s: factor(2-level, coerced to logical) → factor(FALSE/TRUE)\n", dataset_name, col_name))
+          return(factor(x_logic, levels = c(FALSE, TRUE)))
+        } else {
+          warning(sprintf("[%s] %s labeled Boolean but factor with other levels (%s); leaving as factor.",
+                          dataset_name, col_name, paste(lv, collapse = ", ")))
+          return(x)
+        }
+      }
+    } else {
+      warning(sprintf("[%s] %s labeled Boolean but factor with %d levels; leaving as factor.",
+                      dataset_name, col_name, length(lv)))
+      return(x)
+    }
+  }
+
+  # Fallback
+  warning(sprintf("[%s] %s labeled Boolean but type %s; coercing to factor.",
+                  dataset_name, col_name, cls))
+  factor(x)
+}
+
+# Historic data
+for (col in names(historic_data)) {
+  if (!col %in% names(cb_type_lookup_hist)) next
+  col_type <- cb_type_lookup_hist[[col]]
+
+  # Nominal/Ordinal → factor
+  if (col_type %in% c("Nominal", "Ordinal") && !is.factor(historic_data[[col]])) {
+    historic_data[[col]] <- factor(historic_data[[col]])
+    cat(sprintf("  [historic_data] %s: %s → factor (%d levels)\n",
+                col, col_type, nlevels(historic_data[[col]])))
+  }
+
+  # Boolean → TRUE/FALSE factor only
+  if (col_type == "Boolean") {
+    historic_data[[col]] <- coerce_bool_column(historic_data[[col]], col, "historic_data")
+  }
+}
+
+# Predict set
+for (col in names(predict_set)) {
+  if (!col %in% names(cb_type_lookup_pred)) next
+  col_type <- cb_type_lookup_pred[[col]]
+
+  if (col_type %in% c("Nominal", "Ordinal") && !is.factor(predict_set[[col]])) {
+    predict_set[[col]] <- factor(predict_set[[col]])
+    cat(sprintf("  [predict_set] %s: %s → factor (%d levels)\n",
+                col, col_type, nlevels(predict_set[[col]])))
+  }
+
+  if (col_type == "Boolean") {
+    predict_set[[col]] <- coerce_bool_column(predict_set[[col]], col, "predict_set")
+  }
+}
+
+cat("Categorical/Boolean factor conversion complete.\n")
+cat(sprintf("Timestamp: %s\n", Sys.time()))
+flush.console()
+```
+
+```{r}
+# BASELINE SNAPSHOTS (Pre-MICE)
+cat("\n[BASELINE] Creating pre-MICE snapshots...\n"); flush.console()
+
+# Create baseline snapshots before any MICE imputation
+historic_snapshot_pre_mice <- historic_data
+predict_snapshot_pre_mice  <- predict_set
+
+cat("  Baseline snapshots created:\n")
+cat(sprintf("    historic_snapshot_pre_mice: %d rows, %d cols\n", nrow(historic_snapshot_pre_mice), ncol(historic_snapshot_pre_mice)))
+cat(sprintf("    predict_snapshot_pre_mice:  %d rows, %d cols\n", nrow(predict_snapshot_pre_mice), ncol(predict_snapshot_pre_mice)))
+cat(sprintf("Timestamp: %s\n", Sys.time()))
+flush.console()
+```
+
+```{r}
+# SUMMARY: COUNT VARS + NAs BY TYPE/DATASET
+summarize_types_and_nas <- function(df, dataset_name) {
+  # Always recompute type map from the CURRENT df
+  type_map <- get_var_type_map(df)
+  
+  type_categories <- c("Integer", "Continuous", "Nominal", "Ordinal", "Boolean", "Other")
+  
+  # Count columns by type
+  type_vec <- unlist(type_map)
+  type_vec[!(type_vec %in% type_categories)] <- "Other"
+  type_counts <- table(factor(type_vec, levels = type_categories))
+  
+  # Count NAs by type (only over existing columns)
+  na_count <- setNames(integer(length(type_categories)), type_categories)
+  for (col in names(df)) {
+    col_type <- type_map[[col]]
+    if (is.null(col_type) || !(col_type %in% type_categories)) {
+      col_type <- "Other"
+    }
+    na_count[col_type] <- na_count[col_type] + sum(is.na(df[[col]]))
+  }
+  
+  cat(sprintf("=== %s: Columns by Type ===\n", dataset_name))
+  for (tp in type_categories) {
+    cat(sprintf("  %-10s: %d\n", tp, type_counts[tp]))
+  }
+  cat(sprintf("  Total columns: %d\n\n", ncol(df)))
+  
+  cat(sprintf("[NA COUNT] %s:\n", dataset_name))
+  for (tp in type_categories) {
+    cat(sprintf("  %-10s: %d\n", tp, na_count[tp]))
+  }
+  cat("\n")
+  
+  invisible(list(type_map = type_map, na_count = na_count))
+}
+
+# Call for both datasets
+hist_summary  <- summarize_types_and_nas(historic_data, "historic_data")
+pred_summary  <- summarize_types_and_nas(predict_set,   "predict_set")
+
+# Keep the type maps around explicitly
+var_type_map_historic <- hist_summary$type_map
+var_type_map_predict  <- pred_summary$type_map
+
+cat(sprintf("Timestamp: %s\n", Sys.time())); flush.console()
+```
+
+```{r}
+# BLOCK 1: NUMERIC IMPUTATION (PMM ONLY)
+cat("\n[NUMERIC BLOCK] Starting numeric-only MICE run...\n")
+flush.console()
+set.seed(2047)
+
+# Helper: Robustly identify numeric columns based on codebook or data type
+get_numeric_cols <- function(df, cb_types) {
+  # 1. Try codebook lookup
+  vars <- names(df)[sapply(names(df), function(col) {
+    type <- tryCatch(codebook_col_type(col, cb_types), error = function(e) NA)
+    type %in% c("Integer", "Continuous")
+  })]
+  
+  # 2. Fallback: If codebook returns empty (or error), use is.numeric
+  if (length(vars) == 0) {
+    vars <- names(df)[sapply(df, is.numeric)]
+  }
+  return(vars)
+}
+
+# Helper: Identify columns that are safe to use as predictors (Excludes IDs, Addresses, and High-Cardinality Factors)
+get_safe_predictors <- function(df) {
+  names(df)[sapply(df, function(x) {
+    # Must be numeric OR (factor/char with < 50 unique levels)
+    is.numeric(x) || (length(unique(x)) < 50)
+  })]
+}
+
+numeric_cols_hist <- get_numeric_cols(historic_data, cb_types)
+numeric_cols_pred <- get_numeric_cols(predict_set, cb_types)
+
+# Find columns with missing values
+numeric_missing_hist <- numeric_cols_hist[colSums(is.na(historic_data[numeric_cols_hist])) > 0]
+numeric_missing_pred <- numeric_cols_pred[colSums(is.na(predict_set[numeric_cols_pred])) > 0]
+
+cat(sprintf("  Found %d numeric variables in historic_data\n", length(numeric_cols_hist)))
+cat(sprintf("  Found %d numeric variables in predict_set\n", length(numeric_cols_pred)))
+cat(sprintf("  %d numeric vars with NAs in historic_data\n", length(numeric_missing_hist)))
+cat(sprintf("  %d numeric vars with NAs in predict_set\n", length(numeric_missing_pred)))
+flush.console()
+
+impute_numeric <- function(df, dataset_name, numeric_cols) {
+  # 1. Identify Target Columns
+  target_cols <- numeric_cols[colSums(is.na(df[numeric_cols])) > 0]
+  
+  if (!length(target_cols)) { 
+    cat(sprintf("  [%s] No numeric NAs detected, skipping.\n", dataset_name))
+    return(df) 
+  }
+  
+  cat(sprintf("  [%s] Imputing %d numeric vars via PMM...\n", dataset_name, length(target_cols)))
+  
+  # 2. Setup Methods Vector (Only impute target columns)
+  methods <- rep("", ncol(df))
+  names(methods) <- names(df)
+  methods[target_cols] <- "pmm"
+  
+  # 3. Optimize Predictor Matrix (CRITICAL FIX FOR HANGING)
+  # We identify columns that should NOT be used as predictors (High cardinality strings/IDs)
+  safe_predictors <- get_safe_predictors(df)
+  unsafe_predictors <- setdiff(names(df), safe_predictors)
+  
+  cat(sprintf("  [%s] Excluding %d high-cardinality/ID cols from predictors to prevent hanging.\n", 
+              dataset_name, length(unsafe_predictors)))
+  flush.console()
+  
+  # Use quickpred, but explicitly exclude unsafe columns
+  start_time <- Sys.time()
+  pred_matrix <- quickpred(df, 
+                           mincor = 0.4, 
+                           minpuc = 0.5,
+                           exclude = unsafe_predictors) # <--- Prevents using IDs/Addresses
+  
+  # 4. Run MICE
+  mice_obj <- mice(df,
+                   m = 3,
+                   method = methods,
+                   predictorMatrix = pred_matrix,
+                   ridge = 1e-5,
+                   maxit = 2,
+                   seed = 550,
+                   printFlag = FALSE) # Set to FALSE to reduce console spam, we measure time manually
+  
+  elapsed <- difftime(Sys.time(), start_time, units = "mins")
+  cat(sprintf("  [%s] Numeric MICE finished in %.2f minutes\n", dataset_name, elapsed))
+  flush.console()
+  
+  # 5. Return Completed Data
+  complete(mice_obj, 1)
+}
+
+historic_data <- impute_numeric(historic_data, "Historic", numeric_cols_hist)
+predict_set   <- impute_numeric(predict_set,   "Predict", numeric_cols_pred)
+
+cat("[NUMERIC BLOCK] Completed. Remaining numeric NAs:", 
+    sum(is.na(historic_data[numeric_cols_hist])), "(historic),", 
+    sum(is.na(predict_set[numeric_cols_pred])), "(predict)\n")
+```
+
+```{r}
+# BLOCK 2: BOOLEAN IMPUTATION (LOGREG + STRICT FALLBACK)
+cat("\n[BOOLEAN BLOCK] Starting boolean-only imputation with logreg + strict fallback...\n")
+set.seed(2047)
+
+# Rebuild type maps AFTER conversion and dropping
+var_type_map_historic <- get_var_type_map(historic_data)
+var_type_map_predict  <- get_var_type_map(predict_set)
+
+# Mode imputer that also handles 100% NA columns
+simple_boolean_mode_impute <- function(x, col_name, dataset_name) {
+  ux <- na.omit(x)
+
+  # 100% NA: choose conservative default
+  if (length(ux) == 0) {
+    if (is.factor(x)) {
+      lv <- levels(x)
+      if (length(lv) == 0L) {
+        warning(sprintf("[%s] %s: all NA and factor has no levels; leaving as all NA.",
+                        dataset_name, col_name))
+        return(x)
+      }
+      # Prefer FALSE/0 if present, otherwise first level
+      if (any(lv %in% c("FALSE", "0"))) {
+        m_name <- lv[lv %in% c("FALSE", "0")][1L]
+      } else {
+        m_name <- lv[1L]
+      }
+      x[] <- m_name
+      cat(sprintf("    [%s] %s: all NA → filled with factor level '%s'\n",
+                  dataset_name, col_name, m_name))
+      return(x)
+    } else if (is.logical(x)) {
+      x[] <- FALSE
+      cat(sprintf("    [%s] %s: all NA logical → filled with FALSE\n",
+                  dataset_name, col_name))
+      return(x)
+    } else if (is.numeric(x) || is.integer(x)) {
+      x[] <- 0L
+      cat(sprintf("    [%s] %s: all NA numeric → filled with 0\n",
+                  dataset_name, col_name))
+      return(x)
+    } else {
+      warning(sprintf("[%s] %s: all NA, unsupported type %s; leaving as NA.",
+                      dataset_name, col_name, class(x)[1]))
+      return(x)
+    }
+  }
+
+  # Regular mode case
+  tb <- table(ux)
+  m_name <- names(tb)[which.max(tb)]
+
+  if (is.factor(x)) {
+    m <- factor(m_name, levels = levels(x))
+  } else if (is.logical(x)) {
+    m <- as.logical(m_name)
+  } else if (is.numeric(x) || is.integer(x)) {
+    m <- as.numeric(m_name)
+  } else {
+    m <- ux[1]
+  }
+
+  x[is.na(x)] <- m
+  x
+}
+
+get_unsafe_predictors <- function(df) {
+  names(df)[sapply(df, function(x) {
+    (is.character(x) || is.factor(x)) &&
+      (length(unique(na.omit(x))) > 50)
+  })]
+}
+
+coerce_bool_targets_for_mice <- function(df, target_cols, dataset_name) {
+  meta <- lapply(target_cols, function(col) {
+    x <- df[[col]]
+    list(
+      col    = col,
+      class  = class(x)[1],
+      levels = if (is.factor(x)) levels(x) else NULL
+    )
+  })
+  names(meta) <- target_cols
+
+  out <- df
+  for (col in target_cols) {
+    x <- out[[col]]
+    if (is.logical(x)) {
+      out[[col]] <- factor(x, levels = c(FALSE, TRUE))
+    } else if (is.factor(x) && nlevels(x) == 2) {
+      out[[col]] <- droplevels(x)
+    } else if ((is.numeric(x) || is.integer(x)) &&
+               all(na.omit(x) %in% c(0, 1))) {
+      out[[col]] <- factor(x, levels = c(0, 1))
+    } else {
+      warning(sprintf("[%s] %s labeled Boolean but unsuitable for logreg; leaving as-is for MICE.",
+                      dataset_name, col))
+    }
+  }
+
+  list(df = out, meta = meta)
+}
+
+cast_back_bool_targets <- function(df, meta) {
+  out <- df
+  for (col in names(meta)) {
+    if (!col %in% names(out)) next
+    m <- meta[[col]]
+    x <- out[[col]]
+
+    if (m$class == "logical") {
+      out[[col]] <- as.logical(as.character(x))
+    } else if (m$class %in% c("integer", "numeric")) {
+      out[[col]] <- as.integer(as.character(x))
+    } else if (m$class == "factor") {
+      if (!is.null(m$levels)) {
+        out[[col]] <- factor(as.character(x), levels = m$levels)
+      } else {
+        out[[col]] <- factor(x)
+      }
+    }
+  }
+  out
+}
+
+impute_boolean_with_logreg <- function(df, dataset_name, type_map) {
+  bool_cols <- names(type_map)[type_map == "Boolean"]
+  bool_cols <- intersect(bool_cols, names(df))
+
+  if (length(bool_cols) == 0) {
+    cat(sprintf("  [%s] No Boolean columns detected, skipping.\n", dataset_name))
+    return(df)
+  }
+
+  target_cols <- bool_cols[colSums(is.na(df[, bool_cols, drop = FALSE])) > 0]
+  if (length(target_cols) == 0) {
+    cat(sprintf("  [%s] Boolean columns have no NAs, skipping.\n", dataset_name))
+    return(df)
+  }
+
+  cat(sprintf("  [%s] Imputing %d Boolean vars via 'logreg' with fallback...\n",
+              dataset_name, length(target_cols)))
+
+  unsafe_cols <- get_unsafe_predictors(df)
+  cat(sprintf("  [%s] Excluding %d high-cardinality predictors.\n",
+              dataset_name, length(unsafe_cols)))
+  flush.console()
+
+  prep    <- coerce_bool_targets_for_mice(df, target_cols, dataset_name)
+  df_mice <- prep$df
+  meta    <- prep$meta
+
+  methods <- rep("", ncol(df_mice))
+  names(methods) <- names(df_mice)
+  methods[target_cols] <- "logreg"
+
+  mice_failed_or_incomplete <- FALSE
+  cols_remaining_na <- character(0)
+  result <- df_mice
+
+  tryCatch({
+    start_time <- Sys.time()
+
+    pred_matrix <- quickpred(
+      df_mice,
+      mincor = 0.3,
+      minpuc = 0.4,
+      exclude = unsafe_cols
+    )
+
+    mice_obj <- mice(
+      df_mice,
+      m = 3,
+      method = methods,
+      predictorMatrix = pred_matrix,
+      ridge = 1e-5,
+      maxit = 2,
+      seed = 551,
+      printFlag = FALSE
+    )
+
+    elapsed <- difftime(Sys.time(), start_time, units = "mins")
+    cat(sprintf("  [%s] Boolean MICE finished in %.2f minutes\n",
+                dataset_name, elapsed))
+    flush.console()
+
+    result <- complete(mice_obj, 1)
+    result <- result[, names(df_mice), drop = FALSE]
+
+    cols_remaining_na <- target_cols[
+      colSums(is.na(result[, target_cols, drop = FALSE])) > 0
+    ]
+    if (length(cols_remaining_na) > 0) {
+      mice_failed_or_incomplete <- TRUE
+      warning(sprintf("[%s] MICE did not impute all: %s. Fallback to mode imputation.",
+                      dataset_name, paste(cols_remaining_na, collapse = ", ")))
+    }
+  }, error = function(e) {
+    mice_failed_or_incomplete <<- TRUE
+    warning(sprintf("[%s] MICE error: %s. Fallback to mode imputation for all Boolean targets.",
+                    dataset_name, e$message))
+    cols_remaining_na <<- target_cols
+  })
+
+  # Strict fallback: fill everything, even 100% NA columns
+  if (length(cols_remaining_na) > 0) {
+    for (col in cols_remaining_na) {
+      old_na <- sum(is.na(result[[col]]))
+      result[[col]] <- simple_boolean_mode_impute(result[[col]], col, dataset_name)
+      new_na <- sum(is.na(result[[col]]))
+      cat(sprintf("    [%s] Fallback imputed %s: %d -> %d NAs\n",
+                  dataset_name, col, old_na, new_na))
+    }
+  }
+
+  result <- cast_back_bool_targets(result, meta)
+
+  bool_cols_final <- intersect(names(type_map)[type_map == "Boolean"], names(result))
+  rem_na <- sum(is.na(result[, bool_cols_final, drop = FALSE]))
+  cat(sprintf("  [%s] Remaining Boolean NAs (across all Boolean cols): %d\n",
+              dataset_name, rem_na))
+
+  result
+}
+
+historic_data <- impute_boolean_with_logreg(historic_data, "historic_data", var_type_map_historic)
+predict_set   <- impute_boolean_with_logreg(predict_set,   "predict_set",   var_type_map_predict)
+
+# Rebuild type maps if you need them for later steps
+var_type_map_historic <- get_var_type_map(historic_data)
+var_type_map_predict  <- get_var_type_map(predict_set)
+
+bool_hist <- names(var_type_map_historic)[var_type_map_historic == "Boolean"]
+bool_pred <- names(var_type_map_predict)[var_type_map_predict  == "Boolean"]
+
+cat(sprintf("[BOOLEAN BLOCK] Completed. Remaining Boolean NAs: %d (historic), %d (predict)\n",
+            sum(is.na(historic_data[, bool_hist, drop = FALSE])),
+            sum(is.na(predict_set[,   bool_pred, drop = FALSE]))))
+flush.console()
+```
+
+```{r}
+# BLOCK 3.1: CHARACTER IMPUTATION - HYBRID BATCH MICE (CART/SAMPLE)
+cat("\n[CHARACTER BLOCK] Starting nominal character variable imputation...\n")
+cat("Strategy: Batch MICE (CART for <=20 levels, Sample for >20) with Direct Fallback\n")
+flush.console()
+set.seed(2047)
+
+# Direct sampling imputation function (Fallback)
+impute_sample_direct <- function(x) { 
+  if(sum(is.na(x)) == 0) return(x)
+  obs_vals <- x[!is.na(x)]
+  if(length(obs_vals) == 0) return(x)
+  x[is.na(x)] <- sample(obs_vals, sum(is.na(x)), replace=TRUE)
+  return(x)
+}
+
+# Nominal Character Variables (Hardcoded List)
+nominal_char_vars <- c(
+  "econ_tax_cd", "geo_census_tract", "geo_geoid", "geo_commissioner_dist",
+  "geo_fips", "geo_municipality", "geo_school_elem_district", "geo_school_hs_district",
+  "geo_puma", "geo_reps_dist", "geo_senate_dist", "geo_tif_agencynum",
+  "geo_ward", "geo_ssa_name", "geo_ssa_no", "geo_property_address",
+  "geo_property_apt_no", "geo_property_city", "geo_property_zip", "geo_mailing_address",
+  "geo_mailing_state", "geo_mailing_city", "geo_mailing_zip", "meta_cdu",
+  "meta_class", "meta_document_num", "meta_key_pin", "meta_multi_code",
+  "meta_modeling_group", "meta_nbhd", "meta_pin", "meta_town_name",
+  "meta_town_code", "meta_deed_type"
+)
+
+# Filter for existing columns
+character_cols_hist <- nominal_char_vars[nominal_char_vars %in% names(historic_data)]
+character_cols_pred <- nominal_char_vars[nominal_char_vars %in% names(predict_set)]
+
+# Identify missing columns
+character_missing_hist <- character_cols_hist[colSums(is.na(historic_data[character_cols_hist])) > 0]
+character_missing_pred <- character_cols_pred[colSums(is.na(predict_set[character_cols_pred])) > 0]
+
+# Helper Function for Batch MICE
+run_batch_mice <- function(df, target_cols, dataset_name, card_threshold = 20) {
+  if(length(target_cols) == 0) return(df)
+  
+  # Setup Methods Vector
+  methods <- rep("", ncol(df))
+  names(methods) <- names(df)
+  
+  cat(sprintf("[%s] preparing %d variables for batch imputation...\n", dataset_name, length(target_cols)))
+  
+  # Determine method based on cardinality
+  for(col in target_cols) {
+    # Convert to factor for MICE if character
+    if(is.character(df[[col]])) df[[col]] <- as.factor(df[[col]])
+    
+    n_levels <- length(levels(df[[col]]))
+    if(n_levels <= card_threshold && n_levels > 1) {
+      methods[col] <- "cart"
+    } else {
+      methods[col] <- "sample"
+    }
+  }
+  
+  # Run MICE
+  tryCatch({
+    pred_matrix <- quickpred(df, mincor = 0.3, minpuc = 0.5)
+    mice_obj <- mice(df, m = 1, method = methods, predictorMatrix = pred_matrix, 
+                     maxit = 1, seed = 555, printFlag = FALSE)
+    df_out <- complete(mice_obj, 1)
+    
+    # Check for failures and fallback
+    rem_na <- target_cols[colSums(is.na(df_out[target_cols])) > 0]
+    if(length(rem_na) > 0) {
+      cat(sprintf("  [%s] MICE skipped %d vars, applying direct fallback...\n", dataset_name, length(rem_na)))
+      for(c in rem_na) df_out[[c]] <- impute_sample_direct(df_out[[c]])
+    }
+    return(df_out)
+    
+  }, error = function(e) {
+    cat(sprintf("  [%s] MICE Batch Failed (%s). Fallback to direct sampling.\n", dataset_name, e$message))
+    for(c in target_cols) df[[c]] <- impute_sample_direct(df[[c]])
+    return(df)
+  })
+}
+
+# Apply to Historic
+historic_data <- run_batch_mice(historic_data, character_missing_hist, "Historic")
+# Apply to Predict
+predict_set <- run_batch_mice(predict_set, character_missing_pred, "Predict")
+
+cat("\n[BLOCK 3.1 CHARACTER] COMPLETED\n")
+cat("Final missing values:\n")
+cat("  Historic:", sum(is.na(historic_data)), "\n")
+cat("  Predict:", sum(is.na(predict_set)), "\n\n")
+flush.console()
+```
+
+```{r}
+# BLOCK 3.2: NOMINAL IMPUTATION - HYBRID BATCH MICE
+cat("\n[NOMINAL BLOCK] Starting batch nominal imputation...\n")
+cat("Strategy: Batch MICE (CART for <=50 levels, Sample for >50)\n")  # <-- updated message
+flush.console(); set.seed(2047)
+
+# Helper for direct sampling
+impute_sample_direct <- function(x) { 
+  if(sum(is.na(x)) == 0) return(x)
+  obs_vals <- x[!is.na(x)]; if(length(obs_vals) == 0) return(x)
+  x[is.na(x)] <- sample(obs_vals, sum(is.na(x)), replace=TRUE)
+  return(x)
+}
+
+# Get Type Maps
+var_type_map_hist <- get_var_type_map(historic_data)
+var_type_map_pred <- get_var_type_map(predict_set)
+
+# Define Nominal Columns (excluding those handled in Block 3.1)
+nominal_cols_hist <- setdiff(names(var_type_map_hist)[var_type_map_hist == "Nominal"], character_cols_hist)
+nominal_cols_pred <- setdiff(names(var_type_map_pred)[var_type_map_pred == "Nominal"], character_cols_pred)
+
+# Identify missing
+nominal_missing_hist <- nominal_cols_hist[colSums(is.na(historic_data[nominal_cols_hist])) > 0]
+nominal_missing_pred <- nominal_cols_pred[colSums(is.na(predict_set[nominal_cols_pred])) > 0]
+
+# Reuse/Define Batch MICE Helper
+run_batch_mice_nominal <- function(df, target_cols, dataset_name, card_threshold = 50) {  # <-- updated default
+  if(length(target_cols) == 0) return(df)
+  methods <- rep("", ncol(df)); names(methods) <- names(df)
+  
+  cat(sprintf("[%s] Batch imputing %d nominal variables...\n", dataset_name, length(target_cols)))
+  
+  for(col in target_cols) {
+    if(is.character(df[[col]])) df[[col]] <- as.factor(df[[col]])
+    n_levels <- length(levels(df[[col]]))
+    # Use CART for reasonable cardinality, Sample for high
+    methods[col] <- if(n_levels <= card_threshold && n_levels > 1) "cart" else "sample"
+  }
+  
+  tryCatch({
+    pred_matrix <- quickpred(df, mincor = 0.3, minpuc = 0.5)
+    mice_obj <- mice(df, m = 1, method = methods, predictorMatrix = pred_matrix, 
+                     maxit = 1, seed = 556, printFlag = FALSE)
+    df_out <- complete(mice_obj, 1)
+    
+    # Fallback for lingering NAs
+    rem_na <- target_cols[colSums(is.na(df_out[target_cols])) > 0]
+    if(length(rem_na) > 0) {
+      for(c in rem_na) df_out[[c]] <- impute_sample_direct(df_out[[c]])
+    }
+    return(df_out)
+  }, error = function(e) {
+    cat(sprintf("  [%s] Batch failed (%s). Using direct sample fallback.\n", dataset_name, e$message))
+    for(c in target_cols) df[[c]] <- impute_sample_direct(df[[c]])
+    return(df)
+  })
+}
+
+historic_data <- run_batch_mice_nominal(historic_data, nominal_missing_hist, "Historic")
+predict_set   <- run_batch_mice_nominal(predict_set, nominal_missing_pred, "Predict")
+
+cat("[BLOCK 3.2 NOMINAL] COMPLETED\n")
+cat("Final missing values:\n")
+cat("  Historic:", sum(is.na(historic_data)), "\n")
+cat("  Predict:", sum(is.na(predict_set)), "\n\n")
+flush.console()
+```
+
+```{r}
+# BLOCK 3.3: ORDINAL IMPUTATION - HYBRID BATCH MICE
+cat("\n[ORDINAL BLOCK] Starting batch ordinal imputation...\n")
+cat("Strategy: Batch MICE (CART for <=80 levels, Sample for >80)\n")
+flush.console(); set.seed(2047)
+
+var_type_map_hist <- get_var_type_map(historic_data)
+var_type_map_pred <- get_var_type_map(predict_set)
+
+# Identify Ordinal Columns
+ordinal_cols_hist <- names(var_type_map_hist)[var_type_map_hist == "Ordinal"]
+ordinal_cols_pred <- names(var_type_map_pred)[var_type_map_pred == "Ordinal"]
+
+# Identify missing
+ordinal_missing_hist <- ordinal_cols_hist[colSums(is.na(historic_data[ordinal_cols_hist])) > 0]
+ordinal_missing_pred <- ordinal_cols_pred[colSums(is.na(predict_set[ordinal_cols_pred])) > 0]
+
+# Batch MICE Helper
+run_batch_mice_ordinal <- function(df, target_cols, dataset_name, card_threshold = 80) {
+  if(length(target_cols) == 0) return(df)
+  methods <- rep("", ncol(df)); names(methods) <- names(df)
+  
+  cat(sprintf("[%s] Batch imputing %d ordinal variables...\n", dataset_name, length(target_cols)))
+  
+  for(col in target_cols) {
+    if(is.character(df[[col]])) df[[col]] <- as.factor(df[[col]])
+    # Ensure ordered factor if possible, or treat as nominal factor for CART
+    n_levels <- length(levels(df[[col]]))
+    # CART handles ordinal/ordered factors efficiently
+    methods[col] <- if(n_levels <= card_threshold && n_levels > 1) "cart" else "sample"
+  }
+  
+  tryCatch({
+    pred_matrix <- quickpred(df, mincor = 0.3, minpuc = 0.5)
+    mice_obj <- mice(df, m = 1, method = methods, predictorMatrix = pred_matrix, 
+                     maxit = 1, seed = 557, printFlag = FALSE)
+    df_out <- complete(mice_obj, 1)
+    
+    rem_na <- target_cols[colSums(is.na(df_out[target_cols])) > 0]
+    if(length(rem_na) > 0) {
+      for(c in rem_na) df_out[[c]] <- impute_sample_direct(df_out[[c]])
+    }
+    return(df_out)
+  }, error = function(e) {
+    cat(sprintf("  [%s] Batch failed (%s). Using direct sample fallback.\n", dataset_name, e$message))
+    for(c in target_cols) df[[c]] <- impute_sample_direct(df[[c]])
+    return(df)
+  })
+}
+
+historic_data <- run_batch_mice_ordinal(historic_data, ordinal_missing_hist, "Historic")
+predict_set   <- run_batch_mice_ordinal(predict_set, ordinal_missing_pred, "Predict")
+
+cat("[BLOCK 3.3 ORDINAL] COMPLETED\n")
+cat("Final missing values:\n")
+cat("  Historic:", sum(is.na(historic_data)), "\n")
+cat("  Predict:", sum(is.na(predict_set)), "\n\n")
+flush.console()
+```
+
+#### Summary: COUNT VARS + NAs BY TYPE/DATASET
+
+```{r}
+summarize_types_and_nas <- function(df, dataset_name) {
+  # Always recompute type map from the CURRENT df
+  type_map <- get_var_type_map(df)
+  
+  type_categories <- c("Integer", "Continuous", "Nominal", "Ordinal", "Boolean", "Other")
+  
+  # Count columns by type
+  type_vec <- unlist(type_map)
+  type_vec[!(type_vec %in% type_categories)] <- "Other"
+  type_counts <- table(factor(type_vec, levels = type_categories))
+  
+  # Count NAs by type (only over existing columns)
+  na_count <- setNames(integer(length(type_categories)), type_categories)
+  for (col in names(df)) {
+    col_type <- type_map[[col]]
+    if (is.null(col_type) || !(col_type %in% type_categories)) {
+      col_type <- "Other"
+    }
+    na_count[col_type] <- na_count[col_type] + sum(is.na(df[[col]]))
+  }
+  
+  cat(sprintf("=== %s: Columns by Type ===\n", dataset_name))
+  for (tp in type_categories) {
+    cat(sprintf("  %-10s: %d\n", tp, type_counts[tp]))
+  }
+  cat(sprintf("  Total columns: %d\n\n", ncol(df)))
+  
+  cat(sprintf("[NA COUNT] %s:\n", dataset_name))
+  for (tp in type_categories) {
+    cat(sprintf("  %-10s: %d\n", tp, na_count[tp]))
+  }
+  cat("\n")
+  
+  invisible(list(type_map = type_map, na_count = na_count))
+}
+
+# Call for both datasets
+hist_summary  <- summarize_types_and_nas(historic_data, "historic_data")
+pred_summary  <- summarize_types_and_nas(predict_set,   "predict_set")
+
+# Keep the type maps around explicitly
+var_type_map_historic <- hist_summary$type_map
+var_type_map_predict  <- pred_summary$type_map
+
+cat(sprintf("Timestamp: %s\n", Sys.time())); flush.console()
+```
+
+#### Remaining Columns by Datatype & Dataset
+
+```{r}
+# Count remaining rows for each dataset
+cat(sprintf("Rows remaining after cleaning:\n"))
+cat(sprintf("  historic_data: %d rows\n", nrow(historic_data)))
+cat(sprintf("  predict_set:   %d rows\n\n", nrow(predict_set)))
+
+# List columns remaining by datatype for each dataset
+list_columns_by_type <- function(df, type_map, dataset_name) {
+  type_categories <- c("Integer", "Continuous", "Nominal", "Ordinal", "Boolean", "Other")
+  cat(sprintf("Columns by datatype for %s:\n", dataset_name))
+  for(tp in type_categories) {
+    cols <- names(df)[unlist(type_map[names(df)]) == tp]
+    if(length(cols) > 0) {
+      cat(sprintf("  %-10s (%2d): %s\n", tp, length(cols), paste(cols, collapse=", ")))
+    } else {
+      cat(sprintf("  %-10s ( 0): <none>\n", tp))
+    }
+  }
+  cat("\n")
+}
+
+list_columns_by_type(historic_data, var_type_map_historic, "historic_data")
+list_columns_by_type(predict_set,  var_type_map_predict, "predict_set")
+```
+
+---
+### **Exploratory Data Analysis**
+
+#### Summary Statistics (historic_data & predict_set)
+
+```{r}
+cat("=== EDA Buckets & Summary Statistics ===\n\n")
+
+# Helper to bucket variables by type map (rather than get_codebook_types)
+bucket_variables_from_type_map <- function(df, type_map) {
+  # The types will match those set by summarize_types_and_nas
+  raw_type <- unlist(type_map[names(df)])
+  bool_vars <- names(df)[raw_type == "Boolean"]
+  integer_vars_local <- names(df)[raw_type == "Integer"]
+  continuous_vars_local <- names(df)[raw_type == "Continuous"]
+
+  # Fill gaps for numeric columns not tagged by summarize_types_and_nas (shouldn't be needed, but for robustness)
+  numeric_vars_all <- names(df)[sapply(df, is.numeric)]
+  for(v in numeric_vars_all) {
+    if(!(v %in% integer_vars_local) && !(v %in% continuous_vars_local)) {
+      x <- df[[v]]; non_na <- x[!is.na(x)]
+      if(length(non_na) && mean(abs(non_na - round(non_na)) < .Machine$double.eps^0.5) > 0.98) {
+        integer_vars_local <- c(integer_vars_local, v)
+      } else {
+        continuous_vars_local <- c(continuous_vars_local, v)
+      }
+    }
+  }
+
+  ordinal_vars <- names(df)[raw_type == "Ordinal"]
+  nominal_vars <- names(df)[raw_type == "Nominal"]
+
+  factor_vars <- names(df)[sapply(df, is.factor)]
+  ordinal_vars <- union(ordinal_vars, factor_vars[sapply(df[factor_vars], is.ordered)])
+  nominal_vars <- union(nominal_vars, setdiff(factor_vars, ordinal_vars))
+
+  list(
+    integer = unique(integer_vars_local),
+    continuous = unique(continuous_vars_local),
+    ordinal = unique(ordinal_vars),
+    nominal = unique(nominal_vars),
+    boolean = unique(bool_vars),
+    character = names(df)[raw_type == "Character"],
+    numeric_all = unique(c(integer_vars_local, continuous_vars_local))
+  )
+}
+
+# Use variable buckets determined from var_type_map_historic (for both sets, for consistency)
+eda_buckets <- bucket_variables_from_type_map(historic_data, var_type_map_historic)
+integer_vars <- eda_buckets$integer
+continuous_vars <- eda_buckets$continuous
+ordinal_vars <- eda_buckets$ordinal
+nominal_vars <- eda_buckets$nominal
+boolean_vars <- eda_buckets$boolean
+numeric_vars <- eda_buckets$numeric_all
+
+cat("[historic_data]\n")
+cat(sprintf("  Integer: %d | Continuous: %d\n",
+            length(integer_vars), length(continuous_vars)))
+
+# Safe summariser: Ensures only existing variables are included, so select(all_of()) never errors
+safe_existing_vars <- function(vars, df) {
+  intersect(vars, names(df))
+}
+
+summarise_numeric <- function(df, vars, label) {
+  vars <- safe_existing_vars(vars, df)
+  if(!length(vars)) return(NULL)
+  df %>%
+    select(all_of(vars)) %>%
+    summarise(across(everything(),
+                     list(mean = ~mean(.x, na.rm = TRUE),
+                          median = ~median(.x, na.rm = TRUE),
+                          sd = ~sd(.x, na.rm = TRUE),
+                          variance = ~var(.x, na.rm = TRUE),
+                          min = ~min(.x, na.rm = TRUE),
+                          max = ~max(.x, na.rm = TRUE),
+                          missing_pct = ~mean(is.na(.x)) * 100),
+                     .names = "{.col}_{.fn}")) %>%
+    pivot_longer(everything(),
+                 names_to = c("Variable", "Statistic"),
+                 names_pattern = "(.*)_(mean|median|sd|variance|min|max|missing_pct)",
+                 values_to = "Value") %>%
+    pivot_wider(names_from = Statistic, values_from = Value) %>%
+    mutate(Type = label) %>%
+    relocate(Type, Variable)
+}
+
+# Summary for historic_data
+numeric_summary_hist <- bind_rows(
+  summarise_numeric(historic_data, integer_vars, "Integer"),
+  summarise_numeric(historic_data, continuous_vars, "Continuous")
+)
+
+all_summary_hist <- numeric_summary_hist %>%
+  arrange(Type, Variable)
+
+cat("=== Summary statistics for historic_data ===\n\n")
+print(all_summary_hist, n = Inf)
+
+# Summary for predict_set
+cat("\n[predict_set]\n")
+cat(sprintf("  Integer: %d | Continuous: %d\n",
+            length(integer_vars), length(continuous_vars)))
+
+numeric_summary_pred <- bind_rows(
+  summarise_numeric(predict_set, integer_vars, "Integer"),
+  summarise_numeric(predict_set, continuous_vars, "Continuous")
+)
+
+all_summary_pred <- numeric_summary_pred %>%
+  arrange(Type, Variable)
+
+cat("=== Summary statistics for predict_set ===\n\n")
+print(all_summary_pred, n = Inf)
+```
+
+#### Histograms: Integer & Ordinal Distributions
+
+```{r}
+cat("=== Integer & Ordinal Distributions (Faceted Histograms: historic_data only) ===\n")
+
+# Hardcoded mapping for ordinal variable value -> English label
+ordinal_label_map <- list(
+  char_air = c(`1` = "Central A/C", `2` = "No Central A/C"),
+  char_apts = c(`1` = "Two", `2` = "Three", `3` = "Four", `4` = "Five", `5` = "Six", `6` = "None"),
+  char_attic_fnsh = c(`1` = "Living Area", `2` = "Partial", `3` = "None"),
+  char_ext_wall = c(`1` = "Frame", `2` = "Masonry", `3` = "Frame + Masonry", `4` = "Stucco"),
+  char_gar1_area = c(`1` = "Yes", `2` = "No"),
+  char_gar1_att = c(`1` = "Yes", `2` = "No"),
+  char_gar1_cnst = c(`1` = "Frame", `2` = "Masonry"),
+  char_gar1_size = c(`1` = "1 car", `2` = "1.5 cars", `3` = "2 cars", `4` = "2.5 cars", `5` = "3 cars", `6` = "3.5 cars", `7` = "0 cars", `8` = "4 cars"),
+  char_heat = c(`1` = "Warm Air Furnace", `2` = "Hot Water Steam", `3` = "Electric Heater", `4` = "None"),
+  char_oheat = c(`1` = "Floor Furnace", `2` = "Unit Heater", `3` = "Stove", `4` = "Solar", `5` = "None"),
+  char_porch = c(`1` = "Frame Encl.", `2` = "Masonry Encl.", `3` = "None"),
+  char_renovation = c(`1` = "Yes", `2` = "No"),
+  char_repair_cnd = c(`1` = "Above Avg", `2` = "Average", `3` = "Below Avg"),
+  char_roof_cnst = c(`1` = "Shingle+Asphalt", `2` = "Tar+Gravel", `3` = "Slate", `4` = "Shake", `5` = "Tile", `6` = "Other"),
+  char_site = c(`1` = "Beneficial", `2` = "Not Relevant", `3` = "Detracts"),
+  char_tp_dsgn = c(`1` = "Yes", `2` = "No"),
+  char_tp_plan = c(`1` = "Architect", `2` = "Stock Plan"),
+  char_type_resd = c(
+    `1` = "1 Story", `2` = "2 Story", `3` = "3 Story +", `4` = "Split Level",
+    `5` = "1.5 Story", `6` = "1.6 Story", `7` = "1.7 Story", `8` = "1.8 Story", `9` = "1.9 Story"
+  )
+)
+
+plot_batched_histograms <- function(vars, label, batch_size = 9) {
+  # Filter to vars that actually exist
+  vars <- vars[vars %in% names(historic_data)]
+  if (length(vars) == 0) return(invisible(NULL))
+  
+  # Split variables into chunks to prevent overcrowding
+  var_chunks <- split(vars, ceiling(seq_along(vars) / batch_size))
+  
+  for (i in seq_along(var_chunks)) {
+    chunk_vars <- var_chunks[[i]]
+    
+    # Process data for this chunk
+    data_list <- lapply(chunk_vars, function(v) {
+      vec <- historic_data[[v]]
+      
+      # Handle Ordinal Mapping
+      if (label == "Ordinal") {
+        # Check if we have a map
+        if (v %in% names(ordinal_label_map)) {
+          # Map values
+          mapped_vals <- ordinal_label_map[[v]][as.character(vec)]
+          # If map fails (NA), fall back to original value
+          final_vals <- ifelse(is.na(mapped_vals), as.character(vec), mapped_vals)
+          data.frame(Variable = v, Value = final_vals, stringsAsFactors = FALSE)
+        } else {
+          # No map, use raw
+          data.frame(Variable = v, Value = as.character(vec), stringsAsFactors = FALSE)
+        }
+      } else {
+        # Integer processing
+        data.frame(Variable = v, Value = as.numeric(vec), stringsAsFactors = FALSE)
+      }
+    })
+    
+    plot_data <- dplyr::bind_rows(data_list) %>% 
+      dplyr::filter(!is.na(Value))
+    
+    # Create Title
+    suffix <- if (length(var_chunks) > 1) sprintf(" (Batch %d of %d)", i, length(var_chunks)) else ""
+    plot_title <- paste0(label, " Distributions", suffix)
+    
+    # PLOTTING LOGIC
+    if (label == "Integer") {
+      p <- ggplot(plot_data, aes(x = Value)) +
+        geom_histogram(fill = "#2E86AB", color = "white", bins = 30, alpha = 0.9) +
+        facet_wrap(~Variable, scales = "free", ncol = 3) +
+        theme_minimal(base_size = 12) +
+        theme(
+          plot.title = element_text(face = "bold", size = 14, hjust = 0.5, margin = ggplot2::margin(b=10)),
+          strip.text = element_text(face = "bold", size = 10,  margin = ggplot2::margin(b=5)),
+          strip.background = element_rect(fill = "grey96", color = NA),
+          axis.text.x = element_text(size = 9),
+          panel.grid.minor = element_blank(),
+          panel.spacing = unit(1.5, "lines") # Space out facets
+        ) +
+        labs(title = plot_title, x = "Value", y = "Count")
+      
+    } else {
+      # Ordinal Plotting
+      # Wrap long text labels in the data
+      plot_data$Value <- stringr::str_wrap(plot_data$Value, width = 15)
+      
+      p <- ggplot(plot_data, aes(x = Value)) +
+        geom_bar(fill = "#118AB2", color = "white", alpha = 0.9) +
+        facet_wrap(~Variable, scales = "free", ncol = 3) +
+        theme_minimal(base_size = 12) +
+        theme(
+          plot.title = element_text(face = "bold", size = 14, hjust = 0.5, margin = ggplot2::margin(b=10)),
+          strip.text = element_text(face = "bold", size = 10, margin = ggplot2::margin(b=5)),
+          strip.background = element_rect(fill = "grey96", color = NA),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 9), # Angle text to fit
+          panel.grid.major.x = element_blank(),
+          panel.spacing = unit(1.5, "lines")
+        ) +
+        labs(title = plot_title, x = NULL, y = "Count")
+    }
+    
+    print(p)
+  }
+}
+
+# Execute
+plot_batched_histograms(integer_vars, "Integer")
+plot_batched_histograms(ordinal_vars, "Ordinal")
+```
+
+#### Boxplots: Continuous Variable Spread
+
+```{r}
+cat("=== Continuous Variable Spread (Boxplots) ===")
+
+# Use all continuous variables that exist in historic_data
+continuous_vars_historic <- continuous_vars[continuous_vars %in% names(historic_data)]
+
+if (length(continuous_vars_historic) > 0) {
+  
+  # Use ALL continuous vars in historic_data
+  vars_to_plot <- continuous_vars_historic
+  
+  # 1. Calculate summary stats for each variable to build facet labels
+  summary_stats <- purrr::map_dfr(vars_to_plot, function(var) {
+    vals <- historic_data[[var]][!is.na(historic_data[[var]])]
+    Q1   <- quantile(vals, 0.25, na.rm = TRUE)
+    Q3   <- quantile(vals, 0.75, na.rm = TRUE)
+    IQR_val <- Q3 - Q1
+    lower_bound <- Q1 - 1.5 * IQR_val
+    upper_bound <- Q3 + 1.5 * IQR_val
+    outlier_count <- sum(vals < lower_bound | vals > upper_bound, na.rm = TRUE)
+    med_val <- median(vals, na.rm = TRUE)
+    
+    fmt <- function(x) {
+      if (is.na(x)) return(NA_character_)
+      if (abs(x) > 10000) {
+        formatC(x, format = "e", digits = 1)
+      } else {
+        round(x, 2)
+      }
+    }
+    
+    label_text <- paste0(
+      var, "\n",
+      "Med: ", fmt(med_val), " | IQR: ", fmt(IQR_val), "\n",
+      "Outliers: ", outlier_count
+    )
+    
+    tibble::tibble(
+      Variable = var,
+      Label    = label_text
+    )
+  })
+  
+  # 2. Build plotting dataframe and join facet labels
+  plot_df <- purrr::map_dfr(vars_to_plot, function(var) {
+    tibble::tibble(
+      Variable = var,
+      Value    = historic_data[[var]]
+    )
+  }) %>%
+    dplyr::left_join(summary_stats, by = "Variable")
+  
+  # Determine columns in facet grid (up to 4 wide)
+  facet_cols <- min(4, length(vars_to_plot))
+  
+  # 3. Generate plot with one boxplot per facet (all continuous vars)
+  p <- ggplot(plot_df, aes(y = Value, x = "")) +
+    geom_boxplot(
+      fill          = "#4ECDC4",
+      color         = "#023E73",
+      alpha         = 0.8,
+      outlier.colour = "#EF476F",
+      outlier.size  = 1.5,
+      outlier.alpha = 0.6,
+      width         = 0.6
+    ) +
+    facet_wrap(~ Label, scales = "free", ncol = facet_cols) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(
+        size   = 16,
+        face   = "bold",
+        hjust  = 0.5,
+        margin = ggplot2::margin(b = 15)
+      ),
+      strip.text = element_text(
+        face   = "bold",
+        size   = 9,
+        margin = ggplot2::margin(b = 5)
+      ),
+      strip.background   = element_rect(fill = "grey95", color = NA),
+      axis.title.x       = element_blank(),
+      axis.text.x        = element_blank(),
+      axis.ticks.x       = element_blank(),
+      axis.title.y       = element_text(face = "bold", margin = ggplot2::margin(r = 10)),
+      panel.grid.major.x = element_blank(),
+      panel.spacing      = unit(1, "lines")
+    ) +
+    labs(
+      title = "Continuous Variable Spread",
+      y     = "Value Distribution"
+    )
+  
+  print(p)
+}
+```
+
+#### Pie Charts: Nominal Variable Distributions
+
+```{r}
+cat("=== Nominal Variable Distributions (Pie Charts) ===\n")
+
+# 1. Explicit nominal variable list (from summary)
+nominal_vars_historic <- c(
+  "meta_class", "meta_town_code", "meta_nbhd", "meta_deed_type",
+  "char_ext_wall", "char_roof_cnst", "char_bsmt", "char_heat",
+  "char_oheat", "char_tp_plan", "char_gar1_cnst", "char_use",
+  "geo_property_city", "geo_property_zip", "geo_fips", "geo_municipality",
+  "geo_school_elem_district", "geo_school_hs_district", "ind_arms_length"
+)
+
+nominal_vars_historic <- nominal_vars_historic[nominal_vars_historic %in% names(historic_data)]
+
+# 2. Codebook label maps for coded nominal vars
+nominal_codebook_maps <- list(
+  char_ext_wall    = c("1" = "Frame (FRAM)", "2" = "Masonry (MASR)", "3" = "Frame + Masonry (FRMA)", "4" = "Stucco (STUC)"),
+  char_roof_cnst   = c("1" = "Shingle + Asphalt (SHAS)", "2" = "Tar & Gravel (TGRV)", "3" = "Slate (SLAT)", "4" = "Shake (SHKE)", "5" = "Tile (TILE)", "6" = "Other (OTHR)"),
+  char_bsmt        = c("1" = "Full (FL)", "2" = "Slab (SL)", "3" = "Partial (PT)", "4" = "Crawl (CR)"),
+  char_heat        = c("1" = "Warm Air Furnace (FURN)", "2" = "Hot Water Steam (STM)", "3" = "Electric Heater (ELEC)", "4" = "None (NONE)"),
+  char_oheat       = c("1" = "Floor Furnace (FURN)", "2" = "Unit Heater (UNIT)", "3" = "Stove (STVE)", "4" = "Solar (SOLR)", "5" = "None (NONE)"),
+  char_tp_plan     = c("1" = "Architect (ARCT)", "2" = "Stock Plan (STCK)"),
+  char_gar1_cnst   = c("1" = "Frame (FRAM)", "2" = "Masonry (MASR)", "3" = "Frame + Masonry (FRMA)", "4" = "Stucco (STUC)"),
+  char_use         = c("1" = "Single-Family (SF)", "2" = "Multi-Family (MF)"),
+  ind_arms_length  = c("1" = "Arms Length (TRUE)", "2" = "Non-Arms Length (FALSE)")
+)
+
+# thresholds to keep charts readable
+high_card_threshold <- 30
+major_share_cut     <- 0.15
+max_levels_full     <- 10
+
+nominal_pies <- list()
+
+if (length(nominal_vars_historic) > 0) {
+  for (var in nominal_vars_historic) {
+    x <- historic_data[[var]]
+    freq_table <- table(x, useNA = "no")
+    if (length(freq_table) <= 1) next
+
+    df <- as.data.frame(freq_table)
+    colnames(df) <- c("Code", "Count")
+    df$Code <- as.character(df$Code)
+
+    # map coded categories to labels where we have a map
+    if (var %in% names(nominal_codebook_maps)) {
+      map_vec <- nominal_codebook_maps[[var]]
+      codes   <- names(map_vec)
+      labels  <- unname(map_vec)
+      df <- df %>%
+        dplyr::filter(Code %in% codes) %>%
+        mutate(
+          Code  = factor(Code, levels = codes),
+          Label = labels[match(Code, codes)]
+        )
+    } else {
+      df <- df %>%
+        mutate(
+          Code  = factor(Code),
+          Label = as.character(Code)
+        )
+    }
+
+    if (nrow(df) == 0L) next
+
+    df <- df %>%
+      arrange(desc(Count)) %>%
+      mutate(Prop = Count / sum(Count))
+
+    k_levels <- nrow(df)
+
+    # high-cardinality: only sizeable levels + "Other"
+    if (k_levels > high_card_threshold) {
+      major_df <- df %>% dplyr::filter(Prop >= major_share_cut)
+      if (nrow(major_df) == 0L) next
+      other_count <- sum(df$Count[!(df$Code %in% major_df$Code)])
+      df_plot <- major_df %>% dplyr::select(Code, Label, Count)
+      if (other_count > 0) {
+        df_plot <- dplyr::bind_rows(
+          df_plot,
+          tibble::tibble(Code = factor("Other"),
+                         Label = "Other",
+                         Count = other_count)
+        )
+      }
+    } else if (k_levels > max_levels_full) {
+      top_df <- df[1:max_levels_full, ]
+      other_count <- sum(df$Count[(max_levels_full + 1):k_levels])
+      df_plot <- top_df %>% dplyr::select(Code, Label, Count)
+      if (other_count > 0) {
+        df_plot <- dplyr::bind_rows(
+          df_plot,
+          tibble::tibble(Code = factor("Other"),
+                         Label = "Other",
+                         Count = other_count)
+        )
+      }
+    } else {
+      df_plot <- df %>% dplyr::select(Code, Label, Count)
+    }
+
+    df_plot <- df_plot %>%
+      mutate(
+        Percentage = round(Count / sum(Count) * 100, 1),
+        SliceLabel = ifelse(Percentage >= 5, paste0(Percentage, "%"), "")
+      )
+
+    legend_breaks <- as.character(df_plot$Code)
+    legend_labels <- df_plot$Label
+
+    p_pie <- ggplot(df_plot, aes(x = "", y = Count, fill = Code)) +
+      geom_bar(stat = "identity", width = 1, color = "white", linewidth = 0.3) +
+      coord_polar("y", start = 0) +
+      geom_text(
+        aes(label = SliceLabel),
+        position = position_stack(vjust = 0.5),
+        size = 2.8,
+        fontface = "bold",
+        color = "black"
+      ) +
+      theme_void(base_size = 9) +
+      theme(
+        plot.title    = element_text(size = 10, face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(size = 7.5, hjust = 0.5, color = "gray40"),
+        legend.position = "right",
+        legend.title = element_text(size = 8, face = "bold"),
+        legend.text  = element_text(size = 7),
+        plot.margin  = ggplot2::margin(6, 6, 6, 6)
+      ) +
+      labs(
+        title    = paste("Nominal:", var),
+        subtitle = sprintf("Levels=%d | Missing=%.1f%%",
+                           length(freq_table),
+                           mean(is.na(x)) * 100),
+        fill = "Category"
+      ) +
+      scale_fill_discrete(
+        breaks = legend_breaks,
+        labels = legend_labels
+      )
+
+    nominal_pies[[var]] <- p_pie
+  }
+}
+
+if (length(nominal_pies) > 0) {
+  # chunk into small batches so each panel gets more space:
+  batch_size <- 4      # 2 columns x 2 rows per "page"
+  n_plots    <- length(nominal_pies)
+  idx_start  <- seq(1, n_plots, by = batch_size)
+
+  for (s in idx_start) {
+    e <- min(s + batch_size - 1, n_plots)
+    gridExtra::grid.arrange(
+      grobs = nominal_pies[s:e],
+      ncol  = 2
+    )
+  }
+}
+```
+
+#### Bar Charts: Logical / Boolean Variable Ratios
+
+```{r}
+cat("=== Boolean Variable Distributions (Bar Charts) ===\n")
+
+plots <- list()
+
+if (length(boolean_vars) > 0) {
+  for (var in boolean_vars) {
+    if (var %in% names(historic_data)) {
+      vals <- as.logical(historic_data[[var]])
+      
+      freq_data <- data.frame(
+        Value = c("TRUE", "FALSE"),
+        Count = c(sum(vals, na.rm = TRUE), sum(!vals, na.rm = TRUE))
+      ) %>%
+        mutate(
+          Percentage = round(Count / pmax(sum(Count), 1) * 100, 1),
+          Label      = paste0(Percentage, "%")
+        )
+      
+      p_bar <- ggplot(freq_data, aes(x = Value, y = Count, fill = Value)) +
+        geom_bar(stat = "identity", color = "black", alpha = 0.85, width = 0.6) +
+        geom_text(aes(label = Label), vjust = -0.3, size = 3, fontface = "bold") +
+        theme_minimal(base_size = 9) +
+        theme(
+          plot.title        = element_text(size = 10, face = "bold", hjust = 0.5),
+          plot.subtitle     = element_text(size = 8, hjust = 0.5, color = "gray40"),
+          axis.title.x      = element_text(size = 8, face = "bold"),
+          axis.title.y      = element_text(size = 8, face = "bold"),
+          axis.text         = element_text(size = 7),
+          legend.position   = "none",
+          panel.grid.major.x = element_blank(),
+          plot.margin       = ggplot2::margin(3, 3, 3, 3)
+        ) +
+        labs(
+          title    = paste("Boolean:", var),
+          subtitle = sprintf("Missing=%.1f%%", mean(is.na(vals)) * 100),
+          x        = NULL,
+          y        = "Count"
+        ) +
+        scale_fill_manual(values = c("TRUE" = "#4CAF50", "FALSE" = "#F44336")) +
+        scale_y_continuous(expand = expansion(mult = c(0, 0.10)))
+      
+      plots[[var]] <- p_bar
+    }
+  }
+}
+
+if (length(plots) > 0) {
+  # Arrange plots in up to a 3x3 grid
+  n_plots <- length(plots)
+  gridExtra::grid.arrange(grobs = plots, ncol = 3)
+}
+```
+
+#### Correlation Analysis (Pearson, Spearman, Cramer's V)
+
+```{r}
+# Variable type vectors
+numeric_for_corr <- names(var_type_map_historic)[var_type_map_historic %in% c("Integer", "Continuous")]
+boolean_for_corr <- names(var_type_map_historic)[var_type_map_historic == "Boolean"]
+ordinal_for_corr <- names(var_type_map_historic)[var_type_map_historic == "Ordinal"]
+nominal_for_corr <- names(var_type_map_historic)[var_type_map_historic == "Nominal"]
+
+numeric_for_corr <- intersect(numeric_for_corr, names(historic_data))
+boolean_for_corr <- intersect(boolean_for_corr, names(historic_data))
+ordinal_for_corr <- intersect(ordinal_for_corr, names(historic_data))
+nominal_for_corr <- intersect(nominal_for_corr, names(historic_data))
+
+# 1. Pearson for numeric + booleans (0/1)
+if (length(numeric_for_corr) + length(boolean_for_corr) >= 2) {
+  cor_data <- historic_data %>%
+    dplyr::select(any_of(c(numeric_for_corr, boolean_for_corr)))
+
+  # convert booleans to numeric 0/1
+  for (b in boolean_for_corr) {
+    if (b %in% names(cor_data)) {
+      col <- cor_data[[b]]
+      if (is.logical(col)) {
+        cor_data[[b]] <- as.numeric(col)
+      } else if (is.factor(col) && nlevels(col) == 2) {
+        cor_data[[b]] <- as.numeric(col) - 1L
+      }
+    }
+  }
+
+  # keep only numeric, non-constant columns
+  cor_data <- cor_data %>%
+    dplyr::select(where(is.numeric)) %>%
+    dplyr::select(where(~ stats::var(.x, na.rm = TRUE) > 0))
+
+  if (ncol(cor_data) >= 2) {
+    cor_matrix <- stats::cor(cor_data, use = "pairwise.complete.obs", method = "pearson")
+
+    corrplot(
+      cor_matrix,
+      method = "color",
+      type   = "upper",
+      order  = "hclust",
+      tl.col = "black",
+      tl.srt = 45,
+      tl.cex = 0.7,
+      cl.cex = 0.8,
+      col    = colorRampPalette(c("#D32F2F", "#FFFFFF", "#1976D2"))(200),
+      title  = "Pearson Correlation | Integer/Continuous & Boolean",
+      mar    = c(0, 0, 2, 0)
+    )
+  } else {
+    cat("  [Pearson] Fewer than 2 usable numeric/boolean columns after filtering.\n")
+  }
+}
+
+# 2. Spearman for ordinal (rank-based)
+if (length(ordinal_for_corr) >= 2) {
+  ord_data <- historic_data %>%
+    dplyr::select(all_of(ordinal_for_corr))
+
+  # convert to numeric ranks, drop constant columns
+  ord_data_num <- ord_data %>%
+    mutate(across(everything(), ~ as.numeric(as.factor(.x)))) %>%
+    dplyr::select(where(~ stats::var(.x, na.rm = TRUE) > 0))
+
+  if (ncol(ord_data_num) >= 2) {
+    ord_matrix <- stats::cor(ord_data_num, use = "pairwise.complete.obs", method = "spearman")
+
+    corrplot(
+      ord_matrix,
+      method = "color",
+      type   = "upper",
+      order  = "hclust",
+      tl.col = "black",
+      tl.srt = 45,
+      tl.cex = 0.7,
+      cl.cex = 0.8,
+      col    = colorRampPalette(c("#F4B942", "#FFFFFF", "#3A86FF"))(200),
+      title  = "Spearman Correlation | Ordinal",
+      mar    = c(0, 0, 2, 0)
+    )
+  } else {
+    cat("  [Spearman] Fewer than 2 usable ordinal columns after filtering.\n")
+  }
+}
+
+# 3. Cramer's V for nominal (categorical association)
+cramers_v_safe <- function(x, y) {
+  x <- as.factor(x)
+  y <- as.factor(y)
+  ok <- !is.na(x) & !is.na(y)
+  x <- x[ok]
+  y <- y[ok]
+
+  if (length(x) == 0L || length(y) == 0L) return(NA_real_)
+
+  # lengths must match for table(x, y)
+  if (length(x) != length(y)) return(NA_real_)
+
+  tbl <- table(x, y)
+  if (nrow(tbl) < 2 || ncol(tbl) < 2) return(NA_real_)
+
+  chi <- suppressWarnings(chisq.test(tbl))
+  n   <- sum(tbl)
+  if (n == 0) return(NA_real_)
+
+  min_dim <- min(nrow(tbl), ncol(tbl)) - 1
+  if (min_dim <= 0) return(NA_real_)
+
+  as.numeric(sqrt(chi$statistic / (n * min_dim)))
+}
+
+# Keep only nominal vars with reasonable cardinality
+nominal_for_corr_small <- nominal_for_corr[sapply(nominal_for_corr, function(v) {
+  nlevels <- length(unique(historic_data[[v]]))
+  nlevels > 1 && nlevels <= 15
+})]
+
+if (length(nominal_for_corr_small) > 10) {
+  nominal_for_corr_small <- nominal_for_corr_small[1:10]
+}
+
+if (length(nominal_for_corr_small) >= 2) {
+  # compute pairwise Cramer's V using combn → no manual matrix indexing
+  pairs <- utils::combn(nominal_for_corr_small, 2, simplify = FALSE)
+
+  cv_pairs <- lapply(pairs, function(p) {
+    v1 <- p[1]
+    v2 <- p[2]
+    val <- cramers_v_safe(historic_data[[v1]], historic_data[[v2]])
+    data.frame(Var1 = v1, Var2 = v2, Value = val, stringsAsFactors = FALSE)
+  })
+
+  cv_df <- do.call(rbind, cv_pairs)
+  cv_df <- cv_df[!is.na(cv_df$Value), , drop = FALSE]
+
+  if (nrow(cv_df) > 0) {
+    # symmetrize for heatmap: add Var2↔Var1 and diagonal=1
+    vars_all <- sort(unique(c(cv_df$Var1, cv_df$Var2)))
+
+    cv_sym <- cv_df
+    cv_sym <- rbind(
+      cv_sym,
+      data.frame(Var1 = cv_df$Var2, Var2 = cv_df$Var1, Value = cv_df$Value, stringsAsFactors = FALSE),
+      data.frame(Var1 = vars_all,   Var2 = vars_all,   Value = 1,          stringsAsFactors = FALSE)
+    )
+    
+    p_cv <- ggplot(cv_sym, aes(x = Var1, y = Var2, fill = Value)) +
+      geom_tile(color = "white") +
+      scale_fill_gradient2(
+        low  = "#D32F2F",
+        mid  = "#FFFFFF",
+        high = "#1976D2",
+        midpoint = 0.3,
+        limits   = c(0, 1),
+        oob      = scales::squish
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(
+        axis.text.x = element_text(angle = 40, hjust = 1, size = 9),
+        axis.text.y = element_text(size = 9),
+        plot.title  = element_text(face = "bold", hjust = 0.5)
+      ) +
+      labs(
+        title = "Cramer's V | Nominal Associations",
+        x = "",
+        y = "",
+        fill = "Cramer's V"
+      )
+
+    print(p_cv)
+  } else {
+    cat("  [Cramer's V] No valid nominal pairs after filtering.\n")
+  }
+} else {
+  cat("  [Cramer's V] Fewer than 2 nominal variables with acceptable cardinality.\n")
+}
+```
+
+
+
+---
+### **OLS, Decision Tree, Elastic Net, Random Forest, & XGB Modeling**
+
+#### Model Feature Types
+
+```{r}
+## Turn into a tidy data.frame
+var_types <- data.frame(
+  variable = names(historic_data),
+  class    = sapply(historic_data, function(x) paste(class(x), collapse = ", ")),
+  row.names = NULL
+)
+
+print(var_types)
+
+## If you use dplyr
+dplyr::glimpse(historic_data)
+```
+
+#### 70/30 Train:Validation Set Split
+
+```{r}
+set.seed(2047)  # for reproducibility
+
+n <- nrow(historic_data)
+train_idx <- sample(seq_len(n), size = floor(0.7 * n))
+
+historic_data_train <- historic_data[train_idx, ]
+historic_data_val   <- historic_data[-train_idx, ]
+
+```
+
+#### OLS Regression Model
+
+```{r}
+## 1. Combine train + val so factor levels are consistent
+
+data_all <- rbind(historic_data_train, historic_data_val)
+
+## 2. Keep only allowed column types (numeric + factors)
+
+is_allowed_type <- sapply(data_all, function(x) {
+  is.numeric(x) || is.integer(x) || is.factor(x)
+})
+data_all <- data_all[ , is_allowed_type, drop = FALSE]
+
+## 3. Drop / filter very high-cardinality factors
+max_factor_levels <- 40  # tweak as needed
+
+factor_cols <- names(data_all)[sapply(data_all, is.factor)]
+
+factor_levels <- sapply(factor_cols, function(nm) nlevels(data_all[[nm]]))
+high_card_factors <- names(factor_levels[factor_levels > max_factor_levels])
+
+if (length(high_card_factors) > 0) {
+  cat("Dropping high-cardinality factors from OLS (levels >", max_factor_levels, "):\n")
+  print(data.frame(
+    variable = high_card_factors,
+    n_levels = factor_levels[high_card_factors],
+    row.names = NULL
+  ))
+  
+  data_all <- data_all[ , !(names(data_all) %in% high_card_factors), drop = FALSE]
+}
+
+## 4. Coerce integer -> numeric
+for (nm in names(data_all)) {
+  x <- data_all[[nm]]
+  if (is.integer(x)) {
+    data_all[[nm]] <- as.numeric(x)
+  }
+}
+
+## Ensure target is numeric
+stopifnot("sale_price" %in% names(data_all))
+data_all$sale_price <- as.numeric(data_all$sale_price)
+
+## 5. Re-split into train / validation
+n_train <- nrow(historic_data_train)
+
+train_data <- data_all[1:n_train, , drop = FALSE]
+val_data   <- data_all[(n_train + 1):nrow(data_all), , drop = FALSE]
+
+## 6. Drop incomplete rows (if any remain)
+train_data <- train_data[complete.cases(train_data), ]
+val_data   <- val_data[complete.cases(val_data), ]
+
+cat("Training rows after filtering:", nrow(train_data), "\n")
+cat("Validation rows after filtering:", nrow(val_data), "\n")
+cat("Predictors in OLS model:", ncol(train_data) - 1, "\n")
+
+## 7. Fit OLS model on training set
+ols_formula <- as.formula("sale_price ~ .")
+ols_model <- lm(ols_formula, data = train_data)
+summary(ols_model)  # inspect coefficients, R^2, etc.
+
+## 8. Evaluate on validation set
+val_pred <- predict(ols_model, newdata = val_data)
+
+y_true <- val_data$sale_price
+y_hat  <- val_pred
+
+mse  <- mean((y_true - y_hat)^2)
+rmse <- sqrt(mse)
+mae  <- mean(abs(y_true - y_hat))
+
+sst <- sum((y_true - mean(y_true))^2)
+sse <- sum((y_true - y_hat)^2)
+r2_val <- 1 - sse / sst
+
+cat("Validation RMSE:", rmse, "\n")
+cat("Validation MAE :", mae,  "\n")
+cat("Validation MSE :", mse,  "\n")
+cat("Validation R^2 :", r2_val, "\n")
+
+model_results <- if (exists("model_results")) model_results else data.frame(
+  model = character(),
+  RMSE = numeric(),
+  MAE = numeric(),
+  MSE = numeric(),
+  R2 = numeric(),
+  stringsAsFactors = FALSE
+)
+
+model_results <- rbind(model_results, data.frame(
+  model = "OLS Model",
+  RMSE = rmse,
+  MAE = mae,
+  MSE = mse,
+  R2 = r2_val,
+  stringsAsFactors = FALSE
+))
+```
+
+#### Decision Tree Model
+
+```{r}
+set.seed(2047)
+
+# 1. Train / validation split
+n <- nrow(historic_data)
+train_idx <- sample(seq_len(n), size = floor(0.7 * n))
+
+historic_data_train <- historic_data[train_idx, ]
+historic_data_val   <- historic_data[-train_idx, ]
+
+# 2. Combine so encodings are consistent
+data_all <- rbind(historic_data_train, historic_data_val)
+
+prep_for_tree <- function(df) {
+  dat <- df
+  
+  # keep only usable types
+  is_allowed <- sapply(dat, function(x)
+    is.numeric(x) || is.integer(x) || is.factor(x) || is.logical(x))
+  dat <- dat[ , is_allowed, drop = FALSE]
+  
+  # ensure target exists
+  stopifnot("sale_price" %in% names(dat))
+  
+  # logical -> factor
+  log_cols <- names(dat)[sapply(dat, is.logical)]
+  for (nm in log_cols) {
+    dat[[nm]] <- factor(dat[[nm]])
+  }
+  
+  # integer -> numeric
+  int_cols <- names(dat)[sapply(dat, is.integer)]
+  for (nm in int_cols) {
+    dat[[nm]] <- as.numeric(dat[[nm]])
+  }
+  
+  # ensure response is numeric
+  dat$sale_price <- as.numeric(dat$sale_price)
+  
+  # rpart: factors with > 32 levels cause issues; convert to numeric IDs
+  fact_cols <- setdiff(names(dat)[sapply(dat, is.factor)], "sale_price")
+  high_card <- fact_cols[sapply(fact_cols, function(v) nlevels(dat[[v]]) > 32)]
+  if (length(high_card) > 0) {
+    cat("Converting high-cardinality factors to numeric IDs for tree:\n")
+    print(data.frame(
+      variable = high_card,
+      n_levels = sapply(high_card, function(v) nlevels(dat[[v]])),
+      row.names = NULL
+    ))
+    for (nm in high_card) {
+      dat[[nm]] <- as.numeric(dat[[nm]])
+    }
+  }
+  
+  dat
+}
+
+data_all_tree <- prep_for_tree(data_all)
+
+# 3. Re-split into train / validation
+n_train   <- nrow(historic_data_train)
+train_data <- data_all_tree[1:n_train, , drop = FALSE]
+val_data   <- data_all_tree[(n_train + 1):nrow(data_all_tree), , drop = FALSE]
+
+# Drop incomplete rows (tree can handle some NA, but for clean metrics we drop)
+train_data <- train_data[complete.cases(train_data), ]
+val_data   <- val_data[complete.cases(val_data), ]
+
+cat("Decision Tree | training rows:", nrow(train_data), "\n")
+cat("Decision Tree | validation rows:", nrow(val_data), "\n")
+cat("Decision Tree | predictors:", ncol(train_data) - 1, "\n")
+
+# 4. Fit decision tree
+tree_formula <- as.formula("sale_price ~ .")
+
+dt_model <- rpart(
+  formula = tree_formula,
+  data    = train_data,
+  method  = "anova",
+  control = rpart.control(
+    cp       = 0.001,  # complexity penalty; tune if desired
+    minsplit = 20,
+    maxdepth = 20
+  )
+)
+
+cat("\nComplexity parameter table:\n")
+printcp(dt_model)
+
+# Prune to cp with minimum cross-validated error
+best_cp <- dt_model$cptable[which.min(dt_model$cptable[, "xerror"]), "CP"]
+cat("\nUsing cp =", best_cp, "for pruned tree.\n")
+dt_pruned <- prune(dt_model, cp = best_cp)
+
+# 5. Evaluate on validation set
+val_pred <- predict(dt_pruned, newdata = val_data)
+
+y_true <- val_data$sale_price
+y_hat  <- val_pred
+
+mse <- mean((y_true - y_hat)^2)
+rmse <- sqrt(mse)
+mae  <- mean(abs(y_true - y_hat))
+
+sst <- sum((y_true - mean(y_true))^2)
+sse <- sum((y_true - y_hat)^2)
+r2_val <- 1 - sse / sst
+
+cat("\nDecision Tree - Validation RMSE:", rmse, "\n")
+cat("Decision Tree - Validation MAE :", mae,  "\n")
+cat("Decision Tree - Validation MSE :", mse,  "\n")
+cat("Decision Tree - Validation R^2 :", r2_val, "\n")
+
+model_results <- rbind(model_results, data.frame(
+  model = "Decision Tree Model",
+  RMSE = rmse,
+  MAE = mae,
+  MSE = mse,
+  R2 = r2_val,
+  stringsAsFactors = FALSE
+))
+```
+
+#### Ridge / Lasso (Elastic Net) Model
+
+```{r}
+# Use the *same* train_data / val_data you used for OLS after all preprocessing
+x_train <- model.matrix(sale_price ~ ., data = train_data)[, -1]
+y_train <- train_data$sale_price
+
+x_val   <- model.matrix(sale_price ~ ., data = val_data)[, -1]
+y_val   <- val_data$sale_price
+
+set.seed(2047)
+cv_ridge <- cv.glmnet(
+  x = x_train,
+  y = y_train,
+  alpha = 0.5,          # 0 = Ridge, 1 = Lasso, in between = Elastic Net
+  nfolds = 5
+)
+
+best_lambda <- cv_ridge$lambda.min
+
+y_hat_ridge <- as.numeric(predict(cv_ridge, s = best_lambda, newx = x_val))
+
+mse_ridge  <- mean((y_val - y_hat_ridge)^2)
+rmse_ridge <- sqrt(mse_ridge)
+mae_ridge  <- mean(abs(y_val - y_hat_ridge))
+
+sst <- sum((y_val - mean(y_val))^2)
+sse <- sum((y_val - y_hat_ridge)^2)
+r2_ridge <- 1 - sse / sst
+
+cat("Ridge RMSE:", rmse_ridge, "\n")
+cat("Ridge MAE :", mae_ridge,  "\n")
+cat("Ridge MSE :", mse_ridge,  "\n")
+cat("Ridge R^2 :", r2_ridge,   "\n")
+
+model_results <- rbind(model_results, data.frame(
+  model = "Ridge / Lasso (Elastic Net) Model",
+  RMSE = rmse_ridge,
+  MAE = mae_ridge,
+  MSE = mse_ridge,
+  R2 = r2_ridge,
+  stringsAsFactors = FALSE
+))
+
+```
+
+#### Random Forest Model
+
+```{r}
+set.seed(2047)
+
+# 1. PRE-PROCESSING: Drop High-Cardinality features
+drop_cols <- c("meta_nbhd", "geo_property_city", "geo_property_zip", 
+               "geo_fips", "geo_municipality", "geo_school_elem_district", 
+               "geo_school_hs_district")
+
+# Filtered datasets for RF
+train_rf <- train_data[, !(names(train_data) %in% drop_cols)]
+val_rf   <- val_data[, !(names(val_data) %in% drop_cols)]
+
+cat("High cardinality columns dropped. Remaining predictors:", ncol(train_rf)-1, "\n")
+
+set.seed(2047)
+rf_model <- randomForest(
+  sale_price ~ .,
+  data     = train_rf,
+  ntree    = 300,                    
+  mtry     = 24,
+  nodesize = 1,
+  sampsize = 7000,
+  importance = TRUE
+)
+
+# 5. Final Evaluation
+rf_pred <- predict(rf_model, newdata = val_rf)
+
+y_true <- val_rf$sale_price
+y_hat  <- rf_pred
+
+mse_rf  <- mean((y_true - y_hat)^2)
+rmse_rf <- sqrt(mse_rf)
+mae_rf  <- mean(abs(y_true - y_hat))
+sst     <- sum((y_true - mean(y_true))^2)
+sse     <- sum((y_true - y_hat)^2)
+r2_rf   <- 1 - sse / sst
+
+cat("--------------------------------------\n")
+cat("RF RMSE:", rmse_rf, "\n")
+cat("RF MAE:", mae_rf,  "\n")
+cat("RF MSE:", mse_rf,  "\n")
+cat("RF R^2:", r2_rf,   "\n")
+
+# Store results
+model_results <- rbind(model_results, data.frame(
+  model = "Random Forest (Standard Package + Tuned)",
+  RMSE = rmse_rf,
+  MAE = mae_rf,
+  MSE = mse_rf,
+  R2 = r2_rf,
+  stringsAsFactors = FALSE
+))
+```
+
+#### Hyperparameter Titration & Convergence RF Model
+
+```{r}
+# 1. PRE-PROCESSING: Drop High-Cardinality features for Speed
+drop_cols <- c("meta_nbhd", "geo_property_city", "geo_property_zip", 
+               "geo_fips", "geo_municipality", "geo_school_elem_district", 
+               "geo_school_hs_district")
+
+# Create filtered datasets specifically for this model
+train_rf_opt <- train_data[, !(names(train_data) %in% drop_cols)]
+val_rf_opt   <- val_data[, !(names(val_data) %in% drop_cols)]
+
+# 2. Define the scoring function (Optimized for Speed)
+rf_evaluate <- function(mtry, min_node_size, sample_fraction) {
+  
+  # Ranger requires integer values
+  mtry <- floor(mtry)
+  min_node_size <- floor(min_node_size)
+  
+  set.seed(2047)
+  
+  # Train with only 50 trees inside the loop
+  model <- ranger(
+    formula         = sale_price ~ ., 
+    data            = train_rf_opt, 
+    num.trees       = 50,              # Speed II (2:30)
+    mtry            = mtry,
+    min.node.size   = min_node_size,
+    sample.fraction = sample_fraction,
+    respect.unordered.factors = "order", 
+    verbose         = FALSE,
+    num.threads     = parallel::detectCores() - 1 # Use all cores
+  )
+  
+  # Predict on validation set
+  preds <- predict(model, data = val_rf_opt)$predictions
+  
+  # Calculate RMSE (Negative for Maximization)
+  rmse_val <- sqrt(mean((val_rf_opt$sale_price - preds)^2))
+  
+  return(list(Score = -rmse_val, Pred = 0))
+}
+
+# 3. Define the Search Space
+p <- ncol(train_rf_opt) - 1
+
+search_bounds <- list(
+  mtry            = c(2L, p),             
+  min_node_size   = c(1L, 20L),           
+  sample_fraction = c(0.5, 0.9)
+)
+
+cat("Starting Bayesian Optimization (Fast Mode)...\n")
+
+# 4. Run Bayesian Optimization
+set.seed(2047)
+opt_results <- BayesianOptimization(
+  FUN = rf_evaluate,
+  bounds = search_bounds,
+  init_points = 5,     
+  n_iter = 10,          
+  acq = "ucb",          
+  kappa = 2.576,
+  eps = 0.0,
+  verbose = TRUE
+)
+
+# 5. Extract Best Parameters
+best_params <- opt_results$Best_Par
+cat("\nBest Parameters Found:\n")
+print(best_params)
+
+# 6. Train Final Model with Best Parameters (Full Power)
+cat("Training Final Model with Best Parameters...\n")
+
+set.seed(2047)
+final_rf_model <- ranger(
+  formula         = sale_price ~ ., 
+  data            = train_rf_opt, 
+  num.trees       = 300,  # Back to full size
+  mtry            = floor(best_params["mtry"]),
+  min.node.size   = floor(best_params["min_node_size"]),
+  sample.fraction = best_params["sample_fraction"],
+  respect.unordered.factors = "order",
+  importance      = "impurity"
+)
+
+# 7. Final Evaluation
+rf_pred <- predict(final_rf_model, data = val_rf_opt)$predictions
+
+y_true <- val_rf_opt$sale_price
+y_hat  <- rf_pred
+
+rmse_rf_opt <- sqrt(mean((y_true - y_hat)^2))
+mae_rf_opt  <- mean(abs(y_true - y_hat))
+mse_rf_opt  <- mean((y_true - y_hat)^2)
+sst         <- sum((y_true - mean(y_true))^2)
+sse         <- sum((y_true - y_hat)^2)
+r2_rf_opt   <- 1 - sse / sst
+
+cat("--------------------------------------\n")
+cat("RF (Tuned) RMSE:", rmse_rf_opt, "\n")
+cat("RF (Tuned) MAE:", mae_rf_opt, "\n")
+cat("RF (Tuned) MSE:", mse_rf_opt, "\n")
+cat("RF (Tuned) R^2:", r2_rf_opt, "\n")
+
+model_results <- rbind(model_results, data.frame(
+  model = "Hyperparameter Titration & Convergence RF Model",
+  RMSE = rmse_rf_opt,
+  MAE = mae_rf_opt,
+  MSE = mse_rf_opt,
+  R2 = r2_rf_opt,
+  stringsAsFactors = FALSE
+))
+```
+
+#### XGBoost Model
+
+```{r}
+set.seed(2047)
+
+# 1. PRE-PROCESSING drop the same high-cardinality
+drop_cols <- c("meta_nbhd", "geo_property_city", "geo_property_zip", 
+               "geo_fips", "geo_municipality", "geo_school_elem_district", 
+               "geo_school_hs_district")
+
+# Filter datasets
+train_xgb_df <- train_data[, !(names(train_data) %in% drop_cols)]
+val_xgb_df   <- val_data[, !(names(val_data) %in% drop_cols)]
+
+cat("Creating Sparse Matrices (One-Hot Encoding)...\n")
+
+# Create Model Matrices (One-Hot Encoding)
+# Using sparse.model.matrix is much faster and memory efficient for XGBoost
+x_train_sparse <- sparse.model.matrix(sale_price ~ ., data = train_xgb_df)[, -1]
+y_train        <- train_xgb_df$sale_price
+x_val_sparse   <- sparse.model.matrix(sale_price ~ ., data = val_xgb_df)[, -1]
+y_val          <- val_xgb_df$sale_price
+
+# Convert to xgb.DMatrix (XGBoost's native format)
+dtrain <- xgb.DMatrix(data = x_train_sparse, label = y_train)
+dval   <- xgb.DMatrix(data = x_val_sparse,   label = y_val)
+
+# 2. DEFINE HYPERPARAMETERS
+xgb_params <- list(
+  objective        = "reg:squarederror",
+  eta              = 0.05,    # Learning rate (lower = more precise, slower)
+  max_depth        = 6,       # Standard depth (RF usually effectively deeper)
+  subsample        = 0.7,     # Row sampling (prevents overfitting)
+  colsample_bytree = 0.7,     # Column sampling (similar to mtry in RF)
+  tree_method      = "hist"   # CRITICAL: Histogram binning makes this lightning fast
+)
+
+cat("Training XGBoost Model (Fixed Rounds)...\n")
+
+# 3. TRAIN MODEL
+start_time <- Sys.time()
+
+xgb_model <- xgb.train(
+  params                  = xgb_params,
+  data                    = dtrain,
+  nrounds                 = 1000,
+  watchlist               = list(train = dtrain, val = dval),
+  # early_stopping_rounds = 50, # DISABLED to prevent finalizer error
+  print_every_n           = 100,
+  verbose                 = 1
+)
+
+end_time <- Sys.time()
+cat("Training Time:", end_time - start_time, "\n")
+
+# 4. PREDICT & EVALUATE
+y_hat_xgb <- predict(xgb_model, x_val_sparse)
+
+rmse_xgb <- sqrt(mean((y_val - y_hat_xgb)^2))
+mae_xgb  <- mean(abs(y_val - y_hat_xgb))
+mse_xgb  <- mean((y_val - y_hat_xgb)^2)
+sst      <- sum((y_val - mean(y_val))^2)
+sse      <- sum((y_val - y_hat_xgb)^2)
+r2_xgb   <- 1 - sse / sst
+
+cat("\n--------------------------------------\n")
+cat("XGBoost RMSE:", rmse_xgb, "\n")
+cat("XGBoost MAE:", mae_xgb,  "\n")
+cat("XGBoost MSE:", mse_xgb,  "\n")
+cat("XGBoost R^2:", r2_xgb,   "\n")
+
+# Store results
+model_results <- rbind(model_results, data.frame(
+  model = "XGBoost (Fixed Rounds)",
+  RMSE = rmse_xgb,
+  MAE = mae_xgb,
+  MSE = mse_xgb,
+  R2 = r2_xgb,
+  stringsAsFactors = FALSE
+))
+```
+
+#### Model Evaluation
+
+```{r}
+model_results
+```
+
+---
+### **Feature Engineering & Normalization**
+
+```{r}
+set.seed(2047)
+
+# STEP 1: Data Cleaning & Anchor Variable
+clean_data <- historic_data %>%
+  filter(
+    sale_price > 10000,
+    char_bldg_sf > 100,
+    meta_certified_est_bldg > 0
+  )
+
+# The "Assessor Anchor"
+clean_data$total_certified_est <- clean_data$meta_certified_est_bldg + clean_data$meta_certified_est_land
+
+# STEP 2: Split Data (CRITICAL: Must be before Target Encoding)
+train_idx <- createDataPartition(clean_data$sale_price, p = 0.8, list = FALSE)
+train_data <- clean_data[train_idx, ]
+val_data   <- clean_data[-train_idx, ]
+
+# STEP 3: Smoothed Target Encoding (The "Location Fix")
+target_encode_cols <- c(
+  "meta_nbhd", 
+  "meta_town_code", 
+  "geo_school_elem_district", 
+  "geo_school_hs_district", 
+  "geo_municipality"
+)
+
+calc_smooth_mean <- function(df, col, target, m=10) {
+  global_mean <- mean(df[[target]], na.rm=TRUE)
+  df %>%
+    group_by(across(all_of(col))) %>%
+    summarise(
+      count = n(),
+      mean_val = mean(!!sym(target), na.rm=TRUE),
+      .groups = 'drop'
+    ) %>%
+    mutate(
+      smoothed_val = (count * mean_val + m * global_mean) / (count + m)
+    ) %>%
+    select(all_of(col), smoothed_val)
+}
+
+for(col in target_encode_cols) {
+  mapping <- calc_smooth_mean(train_data, col, "sale_price", m=10)
+  new_col_name <- paste0(col, "_encoded")
+  colnames(mapping)[2] <- new_col_name
+  train_data <- left_join(train_data, mapping, by = col)
+  val_data   <- left_join(val_data, mapping, by = col)
+  global_mean <- mean(train_data$sale_price)
+  train_data[[new_col_name]][is.na(train_data[[new_col_name]])] <- global_mean
+  val_data[[new_col_name]][is.na(val_data[[new_col_name]])] <- global_mean
+}
+
+# STEP 4: Interactions (Using the New Encoded Signals)
+add_features <- function(df) {
+  df$inter_size_wealth <- df$char_bldg_sf * df$econ_midincome
+  if("meta_nbhd_encoded" %in% names(df)) {
+    df$inter_size_nbhd <- df$char_bldg_sf * df$meta_nbhd_encoded
+  }
+  df$inter_land_intensity <- df$meta_certified_est_land / (df$char_bldg_sf + 1)
+  return(df)
+}
+
+train_data <- add_features(train_data)
+val_data   <- add_features(val_data)
+
+# STEP 5: Skewness Correction & Factor Prep
+numeric_cols <- names(train_data)[sapply(train_data, is.numeric)]
+numeric_cols <- setdiff(numeric_cols, c("sale_price", paste0(target_encode_cols, "_encoded")))
+
+for(col in numeric_cols) {
+  skew_val <- skewness(train_data[[col]], na.rm = TRUE)
+  if(!is.na(skew_val) && abs(skew_val) > 1.0) {
+    if(min(train_data[[col]], na.rm=TRUE) >= 0) {
+      train_data[[col]] <- log1p(train_data[[col]])
+      val_data[[col]]   <- log1p(val_data[[col]])
+    }
+  }
+}
+
+train_data <- train_data %>% select(-all_of(target_encode_cols))
+val_data   <- val_data %>% select(-all_of(target_encode_cols))
+
+train_data$is_train <- 1
+val_data$is_train   <- 0
+combined <- bind_rows(train_data, val_data)
+
+factor_cols <- names(combined)[sapply(combined, is.factor)]
+for(col in factor_cols) {
+  combined[[col]] <- fct_lump(combined[[col]], n = 15)
+}
+
+dummies <- dummyVars(~ . - sale_price - is_train, data = combined)
+X_combined <- predict(dummies, newdata = combined)
+
+preproc <- preProcess(X_combined, method = "medianImpute")
+X_combined <- predict(preproc, X_combined)
+
+X_train <- X_combined[combined$is_train == 1, ]
+X_val   <- X_combined[combined$is_train == 0, ]
+y_train <- train_data$sale_price
+y_val   <- val_data$sale_price
+
+# STEP 6: Run Models
+if (!exists("model_results")) {
+  model_results <- data.frame(model = character(), RMSE = numeric(), MAE = numeric(), MSE = numeric(), R2 = numeric(), stringsAsFactors = FALSE)
+}
+
+cat("\n--- Starting Target-Encoded Benchmark ---\n")
+
+# Helper for additional metrics
+mape_fun <- function(pred, true) mean(abs((true - pred)/true), na.rm = TRUE) * 100
+mad_fun  <- function(pred, true) mean(abs(pred - true), na.rm = TRUE)
+
+# MODEL 1: OLS
+train_df_ols <- data.frame(sale_price = y_train, X_train)
+ols_model <- lm(sale_price ~ ., data = train_df_ols)
+
+pred_ols <- predict(ols_model, newdata = data.frame(X_val))
+pred_ols <- pmax(pred_ols, 10000)
+
+rmse_ols <- RMSE(pred_ols, y_val)
+mse_ols  <- mean((pred_ols - y_val)^2)
+mae_ols  <- mean(abs(pred_ols - y_val))
+mape_ols <- mape_fun(pred_ols, y_val)
+mad_ols  <- mad_fun(pred_ols, y_val)
+r2_ols   <- R2(pred_ols, y_val)
+model_results <- rbind(model_results, data.frame(model = "OLS (Target Encoded)", RMSE = rmse_ols, MAE = mae_ols, MSE = mse_ols, R2 = r2_ols))
+
+cat("OLS Done.\n")
+cat(sprintf("RMSE: %.2f | MSE: %.2f | MAE: %.2f | MAPE: %.2f%% | MAD: %.2f | R2: %.4f\n",
+            rmse_ols, mse_ols, mae_ols, mape_ols, mad_ols, r2_ols))
+
+# MODEL 2: Elastic Net
+cv_glm <- cv.glmnet(X_train, y_train, alpha = 0.5)
+pred_glm <- as.vector(predict(cv_glm, s = cv_glm$lambda.min, newx = X_val))
+
+rmse_glm <- RMSE(pred_glm, y_val)
+mse_glm  <- mean((pred_glm - y_val)^2)
+mae_glm  <- mean(abs(pred_glm - y_val))
+mape_glm <- mape_fun(pred_glm, y_val)
+mad_glm  <- mad_fun(pred_glm, y_val)
+r2_glm   <- R2(pred_glm, y_val)
+model_results <- rbind(model_results, data.frame(model = "Elastic Net (Target Encoded)", RMSE = rmse_glm, MAE = mae_glm, MSE = mse_glm, R2 = r2_glm))
+
+cat("Elastic Net Done.\n")
+cat(sprintf("RMSE: %.2f | MSE: %.2f | MAE: %.2f | MAPE: %.2f%% | MAD: %.2f | R2: %.4f\n",
+            rmse_glm, mse_glm, mae_glm, mape_glm, mad_glm, r2_glm))
+
+# MODEL 3: Decision Tree
+cart_model <- rpart(sale_price ~ ., data = train_df_ols, method = "anova")
+pred_cart <- predict(cart_model, newdata = data.frame(X_val))
+
+rmse_cart <- RMSE(pred_cart, y_val)
+mse_cart  <- mean((pred_cart - y_val)^2)
+mae_cart  <- mean(abs(pred_cart - y_val))
+mape_cart <- mape_fun(pred_cart, y_val)
+mad_cart  <- mad_fun(pred_cart, y_val)
+r2_cart   <- R2(pred_cart, y_val)
+model_results <- rbind(model_results, data.frame(model = "CART (Target Encoded)", RMSE = rmse_cart, MAE = mae_cart, MSE = mse_cart, R2 = r2_cart))
+
+cat("Decision Tree Done.\n")
+cat(sprintf("RMSE: %.2f | MSE: %.2f | MAE: %.2f | MAPE: %.2f%% | MAD: %.2f | R2: %.4f\n",
+            rmse_cart, mse_cart, mae_cart, mape_cart, mad_cart, r2_cart))
+
+# MODEL 4: Random Forest
+rf_model <- ranger(x = X_train, y = y_train, num.trees = 200, importance = "impurity")
+pred_rf <- predict(rf_model, data = X_val)$predictions
+
+rmse_rf <- RMSE(pred_rf, y_val)
+mse_rf  <- mean((pred_rf - y_val)^2)
+mae_rf  <- mean(abs(pred_rf - y_val))
+mape_rf <- mape_fun(pred_rf, y_val)
+mad_rf  <- mad_fun(pred_rf, y_val)
+r2_rf   <- R2(pred_rf, y_val)
+model_results <- rbind(model_results, data.frame(model = "Random Forest (Target Encoded)", RMSE = rmse_rf, MAE = mae_rf, MSE = mse_rf, R2 = r2_rf))
+
+cat("Random Forest Done.\n")
+cat(sprintf("RMSE: %.2f | MSE: %.2f | MAE: %.2f | MAPE: %.2f%% | MAD: %.2f | R2: %.4f\n",
+            rmse_rf, mse_rf, mae_rf, mape_rf, mad_rf, r2_rf))
+
+# MODEL 5: XGBoost
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dval   <- xgb.DMatrix(data = X_val, label = y_val)
+
+xgb_params <- list(
+  objective = "reg:squarederror",
+  eta = 0.05,             # Slower learning rate for better convergence
+  max_depth = 9,          # Deep trees to leverage interactions
+  subsample = 0.7,
+  colsample_bytree = 0.7,
+  min_child_weight = 5
+)
+
+xgb_model <- xgb.train(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = 1500,         # Fixed rounds, reduced slightly to prevent overfitting without early stop
+  watchlist = list(val = dval),
+  print_every_n = 200,
+  # early_stopping_rounds = 50, # DISABLED to fix 'Inconsistent best_score' error in finalizer
+  verbose = 0
+)
+
+pred_xgb <- predict(xgb_model, dval)
+rmse_xgb <- RMSE(pred_xgb, y_val)
+mse_xgb  <- mean((pred_xgb - y_val)^2)
+mae_xgb  <- mean(abs(pred_xgb - y_val))
+mape_xgb <- mape_fun(pred_xgb, y_val)
+mad_xgb  <- mad_fun(pred_xgb, y_val)
+r2_xgb   <- R2(pred_xgb, y_val)
+model_results <- rbind(model_results, data.frame(model = "XGBoost (Target Encoded)", RMSE = rmse_xgb, MAE = mae_xgb, MSE = mse_xgb, R2 = r2_xgb))
+
+cat("XGBoost Done.\n")
+cat(sprintf("RMSE: %.2f | MSE: %.2f | MAE: %.2f | MAPE: %.2f%% | MAD: %.2f | R2: %.4f\n",
+            rmse_xgb, mse_xgb, mae_xgb, mape_xgb, mad_xgb, r2_xgb))
+
+# Final Output
+cat("\n=== Final Benchmark Results ===\n")
+print(model_results[order(model_results$RMSE), ])
+
+cat("\nTop 5 Variables (Random Forest):\n")
+print(head(sort(importance(rf_model), decreasing = TRUE), 5))
+```
+
+---
+### **Predict Property Data**
+
+```{r}
+set.seed(2047)
+
+# 1. Clean Historic (Training Data)
+train_clean <- historic_data %>%
+  filter(
+    sale_price > 10000,
+    char_bldg_sf > 100,
+    meta_certified_est_bldg > 0
+  )
+
+# 2. Align Predict Set
+common_features <- intersect(names(train_clean), names(predict_set))
+
+# Keep only common features + pid in predict_set
+predict_clean <- predict_set %>%
+  select(pid, all_of(common_features))
+
+# Save PIDs for final submission
+submit_pids <- predict_clean$pid
+
+# 3. Structure for Binding
+predict_clean$sale_price <- NA  # Placeholder target
+predict_clean$is_train   <- 0
+train_clean$is_train     <- 1
+
+# Ensure train_clean has the same columns (minus pid)
+train_clean <- train_clean %>%
+  select(all_of(common_features), sale_price, is_train)
+
+# STEP 2: Feature Engineering (Applied to Both)
+process_features <- function(df) {
+  # Anchor Variable: Total Assessment
+  if(all(c("meta_certified_est_bldg", "meta_certified_est_land") %in% names(df))) {
+    df$total_certified_est <- df$meta_certified_est_bldg + df$meta_certified_est_land
+  }
+  
+  # Wealth Interaction: Size * Income
+  if(all(c("char_bldg_sf", "econ_midincome") %in% names(df))) {
+    df$inter_size_wealth <- df$char_bldg_sf * df$econ_midincome
+  }
+  
+  # Land Intensity: Land Value / (Building Size + 1)
+  if(all(c("meta_certified_est_land", "char_bldg_sf") %in% names(df))) {
+    df$inter_land_intensity <- df$meta_certified_est_land / (df$char_bldg_sf + 1)
+  }
+  
+  return(df)
+}
+
+train_clean   <- process_features(train_clean)
+predict_clean <- process_features(predict_clean)
+
+# STEP 3: Smoothed Target Encoding
+# Use Training Data to learn the average price of specific locations/districts
+target_encode_cols <- c("meta_nbhd", "meta_town_code", "geo_school_elem_district", 
+                        "geo_school_hs_district", "geo_municipality")
+
+# Only encode columns that actually exist in the data
+target_encode_cols <- intersect(target_encode_cols, names(train_clean))
+
+calc_smooth_mean <- function(df, col, target, m=10) {
+  global_mean <- mean(df[[target]], na.rm=TRUE)
+  
+  df %>%
+    group_by(across(all_of(col))) %>%
+    summarise(
+      count = n(),
+      mean_val = mean(!!sym(target), na.rm=TRUE),
+      .groups = 'drop'
+    ) %>%
+    mutate(
+      smoothed_val = (count * mean_val + m * global_mean) / (count + m)
+    ) %>%
+    select(all_of(col), smoothed_val)
+}
+
+for(col in target_encode_cols) {
+  # 1. Learn mapping from TRAIN data only
+  mapping <- calc_smooth_mean(train_clean, col, "sale_price", m=10)
+  new_col_name <- paste0(col, "_encoded")
+  colnames(mapping)[2] <- new_col_name
+  
+  # 2. Apply to Train
+  train_clean <- left_join(train_clean, mapping, by = col)
+  
+  # 3. Apply to Predict Set
+  predict_clean <- left_join(predict_clean, mapping, by = col)
+  
+  # 4. Fill NAs (Unseen neighborhoods in predict set get the Global Mean)
+  global_mean <- mean(train_clean$sale_price, na.rm=TRUE)
+  train_clean[[new_col_name]][is.na(train_clean[[new_col_name]])] <- global_mean
+  predict_clean[[new_col_name]][is.na(predict_clean[[new_col_name]])] <- global_mean
+}
+
+# STEP 4: Secondary Interactions (Post-Encoding)
+if("meta_nbhd_encoded" %in% names(train_clean)) {
+  train_clean$inter_size_nbhd <- train_clean$char_bldg_sf * train_clean$meta_nbhd_encoded
+  predict_clean$inter_size_nbhd <- predict_clean$char_bldg_sf * predict_clean$meta_nbhd_encoded
+}
+
+# STEP 5: Skewness Correction (Log Transform)
+numeric_cols <- names(train_clean)[sapply(train_clean, is.numeric)]
+exclude_cols <- c("sale_price", "pid", "is_train", paste0(target_encode_cols, "_encoded"))
+numeric_cols <- setdiff(numeric_cols, exclude_cols)
+
+vars_to_log <- c()
+
+for(col in numeric_cols) {
+  # Calculate skew on Training Data
+  skew_val <- skewness(train_clean[[col]], na.rm = TRUE)
+  
+  # Check boundaries (log requires non-negative)
+  min_train <- min(train_clean[[col]], na.rm = TRUE)
+  min_pred  <- min(predict_clean[[col]], na.rm = TRUE)
+  
+  # Apply Log if skew > 1 and data is safe
+  if(!is.na(skew_val) && abs(skew_val) > 1.0 && min_train >= 0 && min_pred >= 0) {
+    vars_to_log <- c(vars_to_log, col)
+  }
+}
+
+for(col in vars_to_log) {
+  train_clean[[col]]   <- log1p(train_clean[[col]])
+  predict_clean[[col]] <- log1p(predict_clean[[col]])
+}
+
+# STEP 6: Unified Matrix Construction
+combined <- bind_rows(train_clean, predict_clean)
+
+# Drop raw target encoded cols and PID (we use the encoded versions and don't model on PID)
+cols_to_drop <- c(target_encode_cols, "pid")
+combined <- combined %>% select(-any_of(cols_to_drop))
+
+# Lump remaining factors (Handling Categorical Cardinality)
+factor_cols <- names(combined)[sapply(combined, is.factor)]
+for(col in factor_cols) {
+  combined[[col]] <- fct_lump(combined[[col]], n = 15)
+}
+
+# One-Hot Encoding
+dummies <- dummyVars(~ . - sale_price - is_train, data = combined)
+X_combined <- predict(dummies, newdata = combined)
+
+# Median Imputation
+preproc <- preProcess(X_combined, method = "medianImpute")
+X_combined <- predict(preproc, X_combined)
+
+# Split back into Train and Predict matrices
+X_train_mat <- X_combined[combined$is_train == 1, ]
+y_train_vec <- train_clean$sale_price
+
+X_predict_mat <- X_combined[combined$is_train == 0, ]
+
+# STEP 7: Retrain XGBoost on Full Data
+dtrain_full <- xgb.DMatrix(data = X_train_mat, label = y_train_vec)
+dpredict    <- xgb.DMatrix(data = X_predict_mat)
+
+# Use the best hyperparameters found in validation
+xgb_params <- list(
+  objective = "reg:squarederror",
+  eta = 0.05,
+  max_depth = 9,
+  subsample = 0.7,
+  colsample_bytree = 0.7,
+  min_child_weight = 5
+)
+
+cat("Retraining XGBoost on full historic dataset...\n")
+final_model <- xgb.train(
+  params = xgb_params,
+  data = dtrain_full,
+  nrounds = 2000, 
+  verbose = 0
+)
+
+# STEP 8: Predict & Export
+cat("Generating predictions for", nrow(X_predict_mat), "properties...\n")
+preds <- predict(final_model, dpredict)
+
+# Safety Clamp (prevent negatives)
+preds <- pmax(preds, 10000)
+
+# Create Submission File
+submission <- data.frame(
+  pid = submit_pids,
+  assessed_value = preds
+)
+
+# Format: Ensure numeric, rounded to integer, no scientific notation
+submission$assessed_value <- round(submission$assessed_value, 0)
+
+# Write to CSV
+write_csv(submission, "assessed_value.csv")
+
+cat("Success! 'assessed_value.csv' created.\n")
+print(head(submission))
+```
+
